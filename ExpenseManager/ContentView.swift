@@ -340,7 +340,7 @@ struct ContentView: View {
     }
 
     private var recurringExpenseOverlay: some View {
-        ZStack {
+        ZStack(alignment: .bottom) {
             Color.black.opacity(0.24)
                 .ignoresSafeArea()
                 .onTapGesture {
@@ -354,8 +354,8 @@ struct ContentView: View {
                     isRecurringExpensePresented = false
                 }
             )
-            .frame(maxWidth: 360)
-            .padding(.horizontal, 22)
+            .frame(maxWidth: .infinity)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
         .ignoresSafeArea()
     }
@@ -2390,7 +2390,7 @@ private struct RecurringExpenseModalView: View {
     }
 
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 0) {
             HStack {
                 Button {
                     onCancel()
@@ -2407,105 +2407,113 @@ private struct RecurringExpenseModalView: View {
                 Text("הוסף הוצאה קבועה")
                     .font(.title3.bold())
             }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 14)
 
-            TextField("שם ההוצאה", text: $name)
-                .keyboardType(.default)
-                .textInputAutocapitalization(.never)
-                .multilineTextAlignment(.center)
-                .font(.headline)
-                .padding(.vertical, 12)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-                .onChange(of: name) {
-                    errorMessage = nil
-                }
-
-            HStack(spacing: 0) {
-                Text("₪")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 44)
-
-                TextField("סכום", text: $amountText)
-                    .keyboardType(.decimalPad)
-                    .multilineTextAlignment(.center)
-                    .font(.title2.weight(.semibold))
-                    .padding(.vertical, 12)
-                    .onChange(of: amountText) { _, newValue in
-                        let sanitized = sanitizeAmountInput(newValue)
-
-                        if sanitized != newValue {
-                            amountText = sanitized
-                        }
-
-                        errorMessage = nil
-                    }
-            }
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
-
-            Picker("קטגוריה", selection: $categoryMode) {
-                Text("בחר קיימת").tag(RecurringCategoryMode.existing)
-                Text("צור חדשה").tag(RecurringCategoryMode.new)
-            }
-            .pickerStyle(.segmented)
-
-            if categoryMode == .existing, !categories.isEmpty {
-                Picker("בחר קטגוריה", selection: selectedCategoryBinding) {
-                    ForEach(categories) { category in
-                        Text(category.name).tag(Optional(category.id))
-                    }
-                }
-                .pickerStyle(.menu)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-            } else {
-                TextField("שם קטגוריה חדשה", text: $newCategoryName)
+            VStack(spacing: 18) {
+                TextField("שם ההוצאה", text: $name)
                     .keyboardType(.default)
                     .textInputAutocapitalization(.never)
                     .multilineTextAlignment(.center)
                     .font(.headline)
                     .padding(.vertical, 12)
                     .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-                    .onChange(of: newCategoryName) {
+                    .onChange(of: name) {
                         errorMessage = nil
                     }
 
-                CategoryAppearancePicker(
-                    selectedSystemImageName: $newCategorySystemImageName,
-                    selectedTintName: $newCategoryTintName
-                )
-            }
+                HStack(spacing: 0) {
+                    Text("₪")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 44)
 
-            Text(errorMessage ?? " ")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.red)
-                .frame(height: 18)
+                    TextField("סכום", text: $amountText)
+                        .keyboardType(.decimalPad)
+                        .multilineTextAlignment(.center)
+                        .font(.title2.weight(.semibold))
+                        .padding(.vertical, 12)
+                        .onChange(of: amountText) { _, newValue in
+                            let sanitized = sanitizeAmountInput(newValue)
 
-            Button {
-                guard let amount = parsedAmount else {
-                    errorMessage = "סכום לא תקין"
-                    return
+                            if sanitized != newValue {
+                                amountText = sanitized
+                            }
+
+                            errorMessage = nil
+                        }
+                    }
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+
+                Picker("קטגוריה", selection: $categoryMode) {
+                    Text("בחר קיימת").tag(RecurringCategoryMode.existing)
+                    Text("צור חדשה").tag(RecurringCategoryMode.new)
+                }
+                .pickerStyle(.segmented)
+
+                if categoryMode == .existing, !categories.isEmpty {
+                    Picker("בחר קטגוריה", selection: selectedCategoryBinding) {
+                        ForEach(categories) { category in
+                            Text(category.name).tag(Optional(category.id))
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                } else {
+                    TextField("שם קטגוריה חדשה", text: $newCategoryName)
+                        .keyboardType(.default)
+                        .textInputAutocapitalization(.never)
+                        .multilineTextAlignment(.center)
+                        .font(.headline)
+                        .padding(.vertical, 12)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        .onChange(of: newCategoryName) {
+                            errorMessage = nil
+                        }
+
+                    CategoryAppearancePicker(
+                        selectedSystemImageName: $newCategorySystemImageName,
+                        selectedTintName: $newCategoryTintName
+                    )
                 }
 
-                errorMessage = onSave(
-                    name,
-                    amount,
-                    categoryMode == .existing ? selectedCategoryId : nil,
-                    categoryMode == .new ? newCategoryName : nil,
-                    newCategorySystemImageName,
-                    newCategoryTintName
-                )
-            } label: {
-                Text("שמור")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
+                Text(errorMessage ?? " ")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.red)
+                    .frame(height: 18)
+
+                Button {
+                    guard let amount = parsedAmount else {
+                        errorMessage = "סכום לא תקין"
+                        return
+                    }
+
+                    errorMessage = onSave(
+                        name,
+                        amount,
+                        categoryMode == .existing ? selectedCategoryId : nil,
+                        categoryMode == .new ? newCategoryName : nil,
+                        newCategorySystemImageName,
+                        newCategoryTintName
+                    )
+                } label: {
+                    Text("שמור")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSave)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!canSave)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
         }
-        .padding(20)
-        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 14))
+        .frame(maxWidth: .infinity)
+        .background(Color(.systemBackground))
         .shadow(color: .black.opacity(0.18), radius: 24, x: 0, y: 12)
         .environment(\.layoutDirection, .rightToLeft)
         .onAppear {
