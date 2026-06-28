@@ -20,7 +20,7 @@ struct ContentView: View {
     @State private var isCategorySheetPresented = false
     @State private var isManageCategoriesPresented = false
     @State private var isSettingsPresented = false
-    @State private var isRecurringExpensePresented = false
+    @State private var isAddExpensePresented = false
     @State private var isBackfillExpensePresented = false
     @State private var isManageRecurringExpensesPresented = false
     @State private var isPastExpensesPresented = false
@@ -37,7 +37,7 @@ struct ContentView: View {
                 .padding(.top, 14)
                 .padding(.leading, 16)
 
-            recurringExpenseButton
+            addExpenseButton
                 .padding(.top, 16)
                 .padding(.trailing, 18)
 
@@ -46,8 +46,8 @@ struct ContentView: View {
                     .transition(.opacity)
             }
 
-            if isRecurringExpensePresented {
-                recurringExpenseOverlay
+            if isAddExpensePresented {
+                addExpenseOverlay
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
             }
         }
@@ -269,23 +269,17 @@ struct ContentView: View {
         .accessibilityLabel("תפריט")
     }
 
-    private var recurringExpenseButton: some View {
+    private var addExpenseButton: some View {
         HStack {
             Spacer()
 
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    isRecurringExpensePresented = true
+                    isAddExpensePresented = true
                 }
             } label: {
-                ZStack {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 25, weight: .semibold))
-
-                    Image(systemName: "plus.circle.fill")
-                        .font(.system(size: 13, weight: .bold))
-                        .background(Circle().fill(Color(.systemBackground)))
-                }
+                Image(systemName: "plus")
+                    .font(.system(size: 25, weight: .semibold))
                 .foregroundStyle(.primary)
                 .frame(width: 46, height: 46)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
@@ -295,7 +289,7 @@ struct ContentView: View {
                     }
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("הוסף הוצאה קבועה")
+            .accessibilityLabel("הוסף הוצאה")
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
@@ -339,23 +333,22 @@ struct ContentView: View {
         .ignoresSafeArea()
     }
 
-    private var recurringExpenseOverlay: some View {
-        ZStack(alignment: .bottom) {
+    private var addExpenseOverlay: some View {
+        ZStack {
             Color.black.opacity(0.24)
                 .ignoresSafeArea()
                 .onTapGesture {
-                    isRecurringExpensePresented = false
+                    isAddExpensePresented = false
                 }
 
-            RecurringExpenseModalView(
+            AddExpenseModalView(
                 categories: categories,
-                onSave: saveRecurringExpense,
+                onSave: saveAddedExpense,
                 onCancel: {
-                    isRecurringExpensePresented = false
+                    isAddExpensePresented = false
                 }
             )
-            .frame(maxWidth: .infinity)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .ignoresSafeArea()
     }
@@ -516,9 +509,9 @@ struct ContentView: View {
 
         return expenses
             .filter { expense in
-                expense.categoryId == category.id && expense.createdAt >= monthStart
+                expense.categoryId == category.id && expense.date >= monthStart
             }
-            .sorted { $0.createdAt > $1.createdAt }
+            .sorted { $0.date > $1.date }
     }
 
     private func openCategorySheet() {
@@ -575,13 +568,12 @@ struct ContentView: View {
         Storage.saveCategories(categories)
     }
 
-    private func saveRecurringExpense(
+    private func saveAddedExpense(
         name: String,
         amount: Decimal,
-        existingCategoryId: String?,
-        newCategoryName: String?,
-        newCategorySystemImageName: String,
-        newCategoryTintName: String
+        isRecurring: Bool,
+        date: Date,
+        categoryId: String?
     ) -> String? {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -589,31 +581,34 @@ struct ContentView: View {
             return "צריך שם וסכום תקין"
         }
 
-        let category: ExpenseCategory
-
-        if let existingCategoryId,
-           let existingCategory = categories.first(where: { $0.id == existingCategoryId }) {
-            category = existingCategory
-        } else if let resolvedCategory = resolveCategory(
-            existingCategoryId: nil,
-            newCategoryName: newCategoryName,
-            newCategorySystemImageName: newCategorySystemImageName,
-            newCategoryTintName: newCategoryTintName
-        ) {
-            category = resolvedCategory
-        } else {
-            return "צריך לבחור או ליצור קטגוריה"
+        guard let categoryId,
+              let category = categories.first(where: { $0.id == categoryId }) else {
+            return "צריך לבחור קטגוריה"
         }
 
-        recurringExpenses.append(RecurringExpense(
-            name: trimmedName,
-            amount: amount,
+        expenses.append(Expense(
             categoryId: category.id,
             categoryName: category.name,
-            createdAt: Date()
+            amount: amount,
+            createdAt: Date(),
+            date: date,
+            name: trimmedName,
+            isRecurring: isRecurring
         ))
-        Storage.saveRecurringExpenses(recurringExpenses)
-        isRecurringExpensePresented = false
+        Storage.saveExpenses(expenses)
+
+        if isRecurring {
+            recurringExpenses.append(RecurringExpense(
+                name: trimmedName,
+                amount: amount,
+                categoryId: category.id,
+                categoryName: category.name,
+                createdAt: date
+            ))
+            Storage.saveRecurringExpenses(recurringExpenses)
+        }
+
+        isAddExpensePresented = false
 
         return nil
     }
@@ -1004,7 +999,7 @@ private struct ManageRecurringExpensesView: View {
         NavigationStack {
             List {
                 Section {
-                    TextField("חיפוש לפי שם הוצאה קבועה", text: $searchText)
+                    TextField("חיפוש לפי שם הוצאה חוזרת", text: $searchText)
                         .keyboardType(.default)
                         .textInputAutocapitalization(.never)
                         .multilineTextAlignment(.trailing)
@@ -1346,8 +1341,8 @@ private struct CategoryMonthlyDetailsView: View {
 
     private var filteredExpenses: [Expense] {
         expenses
-            .filter { Calendar.current.isDate($0.createdAt, equalTo: selectedMonth, toGranularity: .month) }
-            .sorted { $0.createdAt > $1.createdAt }
+            .filter { Calendar.current.isDate($0.date, equalTo: selectedMonth, toGranularity: .month) }
+            .sorted { $0.date > $1.date }
     }
 
     private var monthTotal: Decimal {
@@ -1456,7 +1451,7 @@ private struct PastExpensesView: View {
 
     private var expensesForSelectedMonth: [Expense] {
         expenses
-            .filter { Calendar.current.isDate($0.createdAt, equalTo: selectedMonth, toGranularity: .month) }
+            .filter { Calendar.current.isDate($0.date, equalTo: selectedMonth, toGranularity: .month) }
             .filter { expense in
                 guard let selectedCategoryId else {
                     return true
@@ -1464,7 +1459,7 @@ private struct PastExpensesView: View {
 
                 return expense.categoryId == selectedCategoryId
             }
-            .sorted { $0.createdAt > $1.createdAt }
+            .sorted { $0.date > $1.date }
     }
 
     private var groupedExpenses: [ExpenseCategoryExpenseGroup] {
@@ -1783,7 +1778,7 @@ private struct ExpenseDetailRow: View {
                     .font(.headline)
                     .foregroundStyle(expense.source == .backfill ? .red : .primary)
 
-                Text("\(expense.createdAt.shortDateText) - \(expense.amount.formattedShekelAmount)")
+                Text("\(expense.date.shortDateText) - \(expense.amount.formattedShekelAmount)")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(expense.source == .backfill ? .red.opacity(0.8) : .secondary)
             }
@@ -2361,6 +2356,168 @@ private struct BackfillExpenseView: View {
     }
 }
 
+private struct AddExpenseModalView: View {
+    let categories: [ExpenseCategory]
+    let onSave: (String, Decimal, Bool, Date, String?) -> String?
+    let onCancel: () -> Void
+
+    @State private var name = ""
+    @State private var amountText = ""
+    @State private var isRecurring = false
+    @State private var expenseDate = Date()
+    @State private var selectedCategoryId: String?
+    @State private var errorMessage: String?
+
+    private var parsedAmount: Decimal? {
+        Decimal(string: amountText, locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    private var canSave: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (parsedAmount ?? 0) > 0
+            && selectedCategoryId != nil
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button {
+                    onCancel()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.headline)
+                        .frame(width: 38, height: 38)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("סגור")
+
+                Spacer()
+
+                Text("הוסף הוצאה")
+                    .font(.title3.bold())
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 18)
+            .padding(.top, 18)
+            .padding(.bottom, 14)
+
+            Spacer(minLength: 24)
+
+            VStack(spacing: 18) {
+                TextField("שם ההוצאה", text: $name)
+                    .keyboardType(.default)
+                    .textInputAutocapitalization(.never)
+                    .multilineTextAlignment(.center)
+                    .font(.headline)
+                    .padding(.vertical, 12)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .onChange(of: name) {
+                        errorMessage = nil
+                    }
+
+                HStack(spacing: 0) {
+                    Text("₪")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 44)
+
+                    TextField("סכום", text: $amountText)
+                        .keyboardType(.decimalPad)
+                        .multilineTextAlignment(.center)
+                        .font(.title2.weight(.semibold))
+                        .padding(.vertical, 12)
+                        .onChange(of: amountText) { _, newValue in
+                            let sanitized = sanitizeAmountInput(newValue)
+
+                            if sanitized != newValue {
+                                amountText = sanitized
+                            }
+
+                            errorMessage = nil
+                        }
+                }
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+
+                Picker("סוג הוצאה", selection: $isRecurring) {
+                    Text("חד פעמית").tag(false)
+                    Text("הוצאה חוזרת").tag(true)
+                }
+                .pickerStyle(.segmented)
+
+                DatePicker("תאריך", selection: $expenseDate, displayedComponents: .date)
+                    .datePickerStyle(.compact)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.vertical, 8)
+                    .padding(.horizontal, 12)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+                Picker("קטגוריה", selection: selectedCategoryBinding) {
+                    ForEach(categories) { category in
+                        Text(category.name).tag(Optional(category.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+                Text(errorMessage ?? " ")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.red)
+                    .frame(height: 18)
+
+                Button {
+                    guard let amount = parsedAmount else {
+                        errorMessage = "סכום לא תקין"
+                        return
+                    }
+
+                    errorMessage = onSave(name, amount, isRecurring, expenseDate, selectedCategoryId)
+                } label: {
+                    Text("הוסף")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSave)
+            }
+            .padding(.horizontal, 20)
+
+            Spacer(minLength: 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemBackground))
+        .environment(\.layoutDirection, .rightToLeft)
+        .onAppear {
+            selectedCategoryId = categories.first?.id
+        }
+    }
+
+    private var selectedCategoryBinding: Binding<String?> {
+        Binding(
+            get: { selectedCategoryId ?? categories.first?.id },
+            set: { selectedCategoryId = $0 }
+        )
+    }
+
+    private func sanitizeAmountInput(_ input: String) -> String {
+        var sanitized = ""
+        var hasDecimalSeparator = false
+
+        for character in input {
+            if character.isNumber {
+                sanitized.append(character)
+            } else if character == ".", !hasDecimalSeparator {
+                sanitized.append(character)
+                hasDecimalSeparator = true
+            }
+        }
+
+        return sanitized
+    }
+}
+
 private struct RecurringExpenseModalView: View {
     let categories: [ExpenseCategory]
     let onSave: (String, Decimal, String?, String?, String, String) -> String?
@@ -2404,7 +2561,7 @@ private struct RecurringExpenseModalView: View {
 
                 Spacer()
 
-                Text("הוסף הוצאה קבועה")
+                Text("הוסף הוצאה חוזרת")
                     .font(.title3.bold())
             }
             .frame(maxWidth: .infinity)
@@ -2512,7 +2669,7 @@ private struct RecurringExpenseModalView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(.systemBackground))
         .shadow(color: .black.opacity(0.18), radius: 24, x: 0, y: 12)
         .environment(\.layoutDirection, .rightToLeft)
@@ -2970,9 +3127,9 @@ private struct ManageCategoriesView: View {
 
         return expenses
             .filter { expense in
-                expense.categoryId == category.id && expense.createdAt >= monthStart
+                expense.categoryId == category.id && expense.date >= monthStart
             }
-            .sorted { $0.createdAt > $1.createdAt }
+            .sorted { $0.date > $1.date }
     }
 }
 
@@ -3489,7 +3646,9 @@ private struct Expense: Identifiable, Codable {
     let categoryName: String
     let amount: Decimal
     let createdAt: Date
+    let date: Date
     let name: String?
+    let isRecurring: Bool
     let source: ExpenseSource
 
     init(
@@ -3498,7 +3657,9 @@ private struct Expense: Identifiable, Codable {
         categoryName: String,
         amount: Decimal,
         createdAt: Date,
+        date: Date? = nil,
         name: String?,
+        isRecurring: Bool = false,
         source: ExpenseSource = .regular
     ) {
         self.id = id
@@ -3506,7 +3667,9 @@ private struct Expense: Identifiable, Codable {
         self.categoryName = categoryName
         self.amount = amount
         self.createdAt = createdAt
+        self.date = date ?? createdAt
         self.name = name
+        self.isRecurring = isRecurring
         self.source = source
     }
 
@@ -3516,7 +3679,9 @@ private struct Expense: Identifiable, Codable {
         case categoryName
         case amount
         case createdAt
+        case date
         case name
+        case isRecurring
         case source
     }
 
@@ -3528,7 +3693,9 @@ private struct Expense: Identifiable, Codable {
         categoryName = try container.decode(String.self, forKey: .categoryName)
         amount = try container.decode(Decimal.self, forKey: .amount)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
+        date = try container.decodeIfPresent(Date.self, forKey: .date) ?? createdAt
         name = try container.decodeIfPresent(String.self, forKey: .name)
+        isRecurring = try container.decodeIfPresent(Bool.self, forKey: .isRecurring) ?? false
         source = try container.decodeIfPresent(ExpenseSource.self, forKey: .source) ?? .regular
     }
 
@@ -3539,7 +3706,9 @@ private struct Expense: Identifiable, Codable {
             categoryName: categoryName,
             amount: amount,
             createdAt: createdAt,
+            date: date,
             name: name,
+            isRecurring: isRecurring,
             source: source
         )
     }
@@ -3551,7 +3720,9 @@ private struct Expense: Identifiable, Codable {
             categoryName: category.name,
             amount: amount,
             createdAt: createdAt,
+            date: date,
             name: name,
+            isRecurring: isRecurring,
             source: source
         )
     }
