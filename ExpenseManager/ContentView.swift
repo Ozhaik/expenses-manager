@@ -229,9 +229,6 @@ struct ContentView: View {
                                     amountText = sanitized
                                 }
                             }
-
-                        Color.clear
-                            .frame(width: 54)
                     }
                     .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
                     .padding(.horizontal, 44)
@@ -1599,9 +1596,6 @@ private struct EditMonthlyTargetView: View {
 
                         errorMessage = nil
                     }
-
-                Color.clear
-                    .frame(width: 42)
             }
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
 
@@ -1866,9 +1860,6 @@ private struct EditRecurringExpenseView: View {
 
                         errorMessage = nil
                     }
-
-                Color.clear
-                    .frame(width: 42)
             }
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
 
@@ -1988,9 +1979,6 @@ private struct EditCategoryView: View {
 
                         errorMessage = nil
                     }
-
-                Color.clear
-                    .frame(width: 42)
             }
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
 
@@ -2451,9 +2439,6 @@ private struct RecurringExpenseModalView: View {
 
                         errorMessage = nil
                     }
-
-                Color.clear
-                    .frame(width: 44)
             }
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
 
