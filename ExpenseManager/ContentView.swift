@@ -350,7 +350,6 @@ struct ContentView: View {
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .ignoresSafeArea()
     }
 
     private var selectedCategory: ExpenseCategory? {
