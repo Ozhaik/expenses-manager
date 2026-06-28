@@ -282,9 +282,9 @@ struct ContentView: View {
                     .font(.system(size: 25, weight: .semibold))
                 .foregroundStyle(.primary)
                 .frame(width: 46, height: 46)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+                .background(.thinMaterial, in: Circle())
                 .overlay {
-                    RoundedRectangle(cornerRadius: 8)
+                    Circle()
                         .stroke(Color.primary.opacity(0.08), lineWidth: 1)
                     }
             }
@@ -348,7 +348,8 @@ struct ContentView: View {
                     isAddExpensePresented = false
                 }
             )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: 392)
+            .padding(.horizontal, 16)
         }
     }
 
@@ -1068,7 +1069,7 @@ private struct ManageRecurringExpensesView: View {
                     isAddRecurringPresented = false
                 }
             )
-            .presentationDetents([.height(620)])
+            .presentationDetents([.height(460)])
         }
         .sheet(item: $selectedCategoryGroup) { group in
             RecurringExpenseGroupDetailView(
@@ -2378,31 +2379,12 @@ private struct AddExpenseModalView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Button {
-                    onCancel()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.headline)
-                        .frame(width: 38, height: 38)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("סגור")
+        VStack(spacing: 14) {
+            Text("הוסף הוצאה")
+                .font(.title3.bold())
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 2)
 
-                Spacer()
-
-                Text("הוסף הוצאה")
-                    .font(.title3.bold())
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 18)
-            .padding(.top, 18)
-            .padding(.bottom, 14)
-
-            Spacer(minLength: 24)
-
-            VStack(spacing: 18) {
                 TextField("שם ההוצאה", text: $name)
                     .keyboardType(.default)
                     .textInputAutocapitalization(.never)
@@ -2480,13 +2462,13 @@ private struct AddExpenseModalView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!canSave)
-            }
-            .padding(.horizontal, 20)
-
-            Spacer(minLength: 24)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(.systemBackground))
+        .padding(.horizontal, 18)
+        .padding(.top, 18)
+        .padding(.bottom, 16)
+        .frame(maxWidth: .infinity)
+        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 22))
+        .shadow(color: .black.opacity(0.2), radius: 24, x: 0, y: 14)
         .environment(\.layoutDirection, .rightToLeft)
         .onAppear {
             selectedCategoryId = categories.first?.id
@@ -2546,29 +2528,12 @@ private struct RecurringExpenseModalView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Button {
-                    onCancel()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.headline)
-                        .frame(width: 34, height: 34)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("סגור")
+        VStack(spacing: 14) {
+            Text("הוסף הוצאה חוזרת")
+                .font(.title3.bold())
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 2)
 
-                Spacer()
-
-                Text("הוסף הוצאה חוזרת")
-                    .font(.title3.bold())
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 20)
-            .padding(.top, 18)
-            .padding(.bottom, 14)
-
-            VStack(spacing: 18) {
                 TextField("שם ההוצאה", text: $name)
                     .keyboardType(.default)
                     .textInputAutocapitalization(.never)
@@ -2664,11 +2629,11 @@ private struct RecurringExpenseModalView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!canSave)
-            }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 20)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 20)
+        .padding(.top, 18)
+        .padding(.bottom, 16)
+        .frame(maxWidth: .infinity)
         .background(Color(.systemBackground))
         .shadow(color: .black.opacity(0.18), radius: 24, x: 0, y: 12)
         .environment(\.layoutDirection, .rightToLeft)
