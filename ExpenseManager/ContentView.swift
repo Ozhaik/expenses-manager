@@ -29,6 +29,17 @@ private extension View {
             .environment(\.layoutDirection, language.layoutDirection)
             .environment(\.locale, Locale(identifier: language.localeIdentifier))
     }
+
+    func localizedTextInput(_ language: AppLanguage) -> some View {
+        multilineTextAlignment(.center)
+            .environment(\.layoutDirection, language.layoutDirection)
+            .environment(\.locale, Locale(identifier: language.localeIdentifier))
+    }
+
+    func localizedFieldMessage(_ language: AppLanguage) -> some View {
+        multilineTextAlignment(language.textAlignment)
+            .frame(maxWidth: .infinity, alignment: language.frameAlignment)
+    }
 }
 
 private func categoryTargetRatioText(_ status: CategoryMonthlyTargetStatus, language: AppLanguage) -> String {
@@ -55,8 +66,37 @@ private func categoryTargetStatusLineText(_ status: CategoryMonthlyTargetStatus,
     )
 }
 
+private func categoryTargetMainProgressText(_ status: CategoryMonthlyTargetStatus, language: AppLanguage) -> String {
+    let usedPercentage = status.targetAmount > 0 ? status.spentAmount / status.targetAmount * 100 : 0
+    let progressText = "\(status.spentAmount.mainTargetAmountText(for: language))/\(status.targetAmount.mainTargetAmountText(for: language)) (\(usedPercentage.formattedPercentText))"
+    return language == .he ? "\u{200E}\(progressText)\u{200E}" : progressText
+}
+
+private func categoryTargetMainRemainingText(_ status: CategoryMonthlyTargetStatus, language: AppLanguage) -> String {
+    if status.isOverBudget {
+        return language.text(
+            he: "חריגה של \(status.overBudgetAmount.formattedShekelAmount)",
+            en: "Over by \(status.overBudgetAmount.formattedShekelAmount)"
+        )
+    }
+
+    return language.text(
+        he: "נשאר: \(status.remainingAmount.formattedShekelAmount)",
+        en: "Left: \(status.remainingAmount.formattedShekelAmount)"
+    )
+}
+
 private func categoryMonthlyTargetStatusText(_ status: CategoryMonthlyTargetStatus, language: AppLanguage) -> String {
     "\(categoryTargetRatioText(status, language: language))\n\(categoryTargetStatusLineText(status, language: language))"
+}
+
+private func isValidSetupUserName(_ name: String) -> Bool {
+    let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !normalizedName.isEmpty else {
+        return false
+    }
+
+    return !["qa", "user", "משתמש"].contains(normalizedName)
 }
 
 
@@ -64,6 +104,11 @@ struct ContentView: View {
     @StateObject private var appSettings = AppSettingsStore()
     @State private var currentCategoryIndex = 0
     @State private var amountText = ""
+    @State private var mainSelectedCurrency: CurrencyOption = Storage.loadTemporaryCurrency(primaryCurrency: Storage.loadCurrency())
+    @State private var temporaryCurrencyStartDate: Date? = Storage.loadTemporaryCurrencyStartDate()
+    @State private var temporaryCurrencyExpirationDate: Date? = Storage.loadTemporaryCurrencyExpirationDate()
+    @State private var isTemporaryCurrencyForCurrentExpenseOnly = false
+    @State private var isTemporaryCurrencySheetPresented = false
     @State private var expenses: [Expense] = []
     @State private var recurringExpenses: [RecurringExpense] = []
     @State private var salaryEntries: [SalaryEntry] = []
@@ -72,6 +117,7 @@ struct ContentView: View {
     @State private var appTheme: AppTheme = .system
     @State private var userName = ""
     @State private var currency: CurrencyOption = .ils
+    @State private var dateDisplayFormat: DateDisplayFormat = .dayMonthYear
     @State private var salaryReceiptDay = 1
     @State private var checkingBalance: Decimal?
     @State private var isUserNamePromptPresented = false
@@ -113,6 +159,7 @@ struct ContentView: View {
     @State private var categoryNavigationLockID = 0
     @State private var rootRefreshID = UUID()
     @State private var isLanguageRefreshOverlayPresented = false
+    @State private var isInitialSetupPresented = false
 
     private let dragThreshold: CGFloat = 55
     private let categoryNavigationLockDuration: TimeInterval = 0.34
@@ -132,10 +179,39 @@ struct ContentView: View {
         Binding(
             get: { currency },
             set: { newValue in
+                let previousPrimaryCurrency = currency
                 currency = newValue
                 Storage.saveCurrency(newValue)
+                CurrencyExchangeService.markRatesStale()
+
+                if mainSelectedCurrency == previousPrimaryCurrency {
+                    mainSelectedCurrency = newValue
+                    temporaryCurrencyExpirationDate = nil
+                    Storage.clearTemporaryCurrency()
+                } else {
+                    validateTemporaryCurrencySelection(primaryCurrency: newValue)
+                }
+
                 refreshCurrencyUI()
             }
+        )
+    }
+
+    private var dateDisplayFormatBinding: Binding<DateDisplayFormat> {
+        Binding(
+            get: { dateDisplayFormat },
+            set: { newValue in
+                dateDisplayFormat = newValue
+                Storage.saveDateDisplayFormat(newValue)
+                refreshDateFormatUI()
+            }
+        )
+    }
+
+    private var currencyConversionUnavailableMessage: String {
+        appLanguage.text(
+            he: "לא ניתן להמיר מטבע כרגע. נסה שוב אחרי עדכון שערים.",
+            en: "Currency conversion is unavailable. Try again after rates update."
         )
     }
 
@@ -236,10 +312,19 @@ struct ContentView: View {
         .id(rootRefreshID)
         .onAppear {
             loadStoredData()
-            presentSalaryPromptIfNeeded()
+            if !isInitialSetupPresented {
+                presentSalaryPromptIfNeeded()
+            }
         }
         .onChange(of: appSettings.language) { _, _ in
             refreshLanguageUI()
+        }
+        .fullScreenCover(isPresented: $isInitialSetupPresented) {
+            FirstLaunchSetupView(
+                initialLanguage: appLanguage,
+                onComplete: completeInitialSetup
+            )
+            .interactiveDismissDisabled()
         }
         .sheet(isPresented: $isUserNamePromptPresented) {
             UserNamePromptView(
@@ -255,6 +340,19 @@ struct ContentView: View {
             .localizedPresentationEnvironment(appLanguage)
             .interactiveDismissDisabled()
             .presentationDetents([.height(240)])
+        }
+        .sheet(isPresented: $isTemporaryCurrencySheetPresented) {
+            TemporaryCurrencySheet(
+                selectedCurrency: mainSelectedCurrency,
+                primaryCurrency: currency,
+                onSelectCurrentExpense: selectTemporaryCurrencyForCurrentExpense,
+                onSelectDateRange: selectTemporaryCurrencyRange,
+                onClose: {
+                    isTemporaryCurrencySheetPresented = false
+                }
+            )
+            .localizedPresentationEnvironment(appLanguage)
+            .presentationDetents([.fraction(0.72), .large])
         }
         .sheet(isPresented: $isNamingSheetPresented) {
             ExpenseNameView(
@@ -312,6 +410,7 @@ struct ContentView: View {
                 userName: userName,
                 currency: currencyBinding,
                 appLanguage: appLanguageBinding,
+                dateDisplayFormat: dateDisplayFormatBinding,
                 salaryReceiptDay: $salaryReceiptDay,
                 checkingBalance: $checkingBalance,
                 onSaveUserName: { name in
@@ -433,17 +532,27 @@ struct ContentView: View {
             )
             .localizedPresentationEnvironment(appLanguage)
         }
+        .task {
+            await CurrencyExchangeService.refreshIfNeeded()
+            validateTemporaryCurrencySelection(primaryCurrency: currency)
+        }
+        .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { _ in
+            validateTemporaryCurrencySelection(primaryCurrency: currency)
+        }
     }
 
     private var mainContent: some View {
         VStack(spacing: 0) {
             Color.clear
-                .frame(height: 4)
+                .frame(height: 24)
 
             VStack(spacing: 4) {
                 Text(welcomeText)
                     .font(.title3.weight(.bold))
                     .foregroundStyle(.primary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
 
                 Text(monthlyExpenseSummaryText)
                     .font(.subheadline.weight(.semibold))
@@ -456,7 +565,8 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
-            .padding(.bottom, 8)
+            .padding(.horizontal, 58)
+            .padding(.bottom, 12)
 
             HStack(spacing: 8) {
                 categoryNavigationButton(
@@ -491,7 +601,7 @@ struct ContentView: View {
                     }
                 }
                 .frame(maxWidth: .infinity)
-                .frame(height: 246)
+                .frame(height: 260)
                 .clipped()
 
                 categoryNavigationButton(
@@ -519,15 +629,25 @@ struct ContentView: View {
                 openCategorySheet()
             } label: {
                 Label(appLanguage.text(he: "הוסף קטגוריה", en: "Add Category"), systemImage: "plus.circle")
-                    .font(.subheadline.weight(.semibold))
+                    .font(.footnote.weight(.semibold))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(Color.secondary.opacity(0.12), in: Capsule())
+                    .foregroundStyle(.primary)
             }
-            .buttonStyle(.borderless)
-            .padding(.top, 10)
+            .buttonStyle(.plain)
+            .padding(.top, 8)
 
             VStack(spacing: 14) {
                 if selectedCategory != nil {
-                    AmountInputField(amountText: $amountText)
-                        .frame(width: 218)
+                    AmountInputField(
+                        amountText: $amountText,
+                        selectedCurrency: $mainSelectedCurrency,
+                        onCurrencyButtonTapped: {
+                            isTemporaryCurrencySheetPresented = true
+                        }
+                    )
+                        .frame(width: 250)
                 }
             }
             .padding(.top, 2)
@@ -818,18 +938,10 @@ struct ContentView: View {
             return appLanguage.text(he: "אין הוצאות עדיין", en: "No expenses yet")
         }
 
-        guard let monthlyExpenseGoal else {
-            return appLanguage.text(
-                he: "הוצאת החודש \(currentMonthExpenseTotal.formattedShekelAmount)",
-                en: "Spent this month \(currentMonthExpenseTotal.formattedShekelAmount)"
-            )
-        }
-
-        let status = CategoryMonthlyTargetStatus(
-            targetAmount: monthlyExpenseGoal,
-            spentAmount: currentMonthExpenseTotal
+        return appLanguage.text(
+            he: "הוצאת החודש \(currentMonthExpenseTotal.formattedShekelAmount)",
+            en: "Spent this month \(currentMonthExpenseTotal.formattedShekelAmount)"
         )
-        return "\(categoryTargetRatioText(status, language: appLanguage))\n\(categoryTargetStatusLineText(status, language: appLanguage))"
     }
 
     private var selectedCategoryTargetStatus: CategoryMonthlyTargetStatus? {
@@ -879,15 +991,79 @@ struct ContentView: View {
             return
         }
 
+        guard let conversion = CurrencyExchangeService.convert(amount: amount, from: mainSelectedCurrency, to: currency) else {
+            mainAlertMessage = currencyConversionUnavailableMessage
+            return
+        }
+
         pendingExpense = Expense(
             categoryId: selectedCategory.id,
             categoryName: selectedCategory.name,
-            amount: amount,
+            amount: conversion.convertedAmount,
             createdAt: Date(),
-            name: nil
+            name: nil,
+            originalAmount: amount,
+            originalCurrencyCode: mainSelectedCurrency.code,
+            exchangeRate: conversion.exchangeRate,
+            exchangeRateDate: conversion.exchangeRateDate,
+            convertedAmount: conversion.convertedAmount,
+            convertedCurrencyCode: currency.code
         )
         expenseName = ""
         isNamingSheetPresented = true
+    }
+
+    private func selectTemporaryCurrencyForCurrentExpense(_ selectedCurrency: CurrencyOption) {
+        mainSelectedCurrency = selectedCurrency
+        temporaryCurrencyStartDate = nil
+        temporaryCurrencyExpirationDate = nil
+        isTemporaryCurrencyForCurrentExpenseOnly = true
+        Storage.clearTemporaryCurrency()
+
+        isTemporaryCurrencySheetPresented = false
+    }
+
+    private func selectTemporaryCurrencyRange(_ selectedCurrency: CurrencyOption, startDate: Date, endDate: Date) {
+        let normalizedStartDate = Calendar.current.startOfDay(for: startDate)
+        let normalizedEndDate = Calendar.current.date(bySettingHour: 23, minute: 59, second: 59, of: endDate) ?? endDate
+
+        temporaryCurrencyStartDate = normalizedStartDate
+        temporaryCurrencyExpirationDate = normalizedEndDate
+        isTemporaryCurrencyForCurrentExpenseOnly = false
+        Storage.saveTemporaryCurrency(selectedCurrency, startDate: normalizedStartDate, expirationDate: normalizedEndDate)
+        validateTemporaryCurrencySelection(primaryCurrency: currency)
+
+        isTemporaryCurrencySheetPresented = false
+    }
+
+    private func validateTemporaryCurrencySelection(primaryCurrency: CurrencyOption) {
+        if isTemporaryCurrencyForCurrentExpenseOnly {
+            return
+        }
+
+        guard let storedCurrency = Storage.loadStoredTemporaryCurrency() else {
+            mainSelectedCurrency = primaryCurrency
+            return
+        }
+
+        if let startDate = temporaryCurrencyStartDate, startDate > Date() {
+            mainSelectedCurrency = primaryCurrency
+            return
+        }
+
+        guard let expirationDate = temporaryCurrencyExpirationDate else {
+            mainSelectedCurrency = storedCurrency
+            return
+        }
+
+        if expirationDate <= Date() {
+            mainSelectedCurrency = primaryCurrency
+            temporaryCurrencyStartDate = nil
+            temporaryCurrencyExpirationDate = nil
+            Storage.clearTemporaryCurrency()
+        } else {
+            mainSelectedCurrency = storedCurrency
+        }
     }
 
     private func savePendingExpenseWithName() {
@@ -916,6 +1092,11 @@ struct ContentView: View {
         expenseName = ""
         amountText = ""
         isNamingSheetPresented = false
+
+        if isTemporaryCurrencyForCurrentExpenseOnly {
+            mainSelectedCurrency = currency
+            isTemporaryCurrencyForCurrentExpenseOnly = false
+        }
     }
 
     private func selectNextCategory() {
@@ -997,15 +1178,10 @@ struct ContentView: View {
         let calendar = Calendar.current
         let now = Date()
 
-        guard let monthStart = calendar.date(
-            from: calendar.dateComponents([.year, .month], from: now)
-        ) else {
-            return []
-        }
-
         return expenses
             .filter { expense in
-                expense.categoryId == category.id && expense.date >= monthStart
+                expense.categoryId == category.id
+                    && calendar.isDate(expense.date, equalTo: now, toGranularity: .month)
             }
             .sorted { $0.date > $1.date }
     }
@@ -1321,6 +1497,7 @@ struct ContentView: View {
     private func persistAppSettings() {
         Storage.saveCurrency(currency)
         Storage.saveAppLanguage(appLanguage)
+        Storage.saveDateDisplayFormat(dateDisplayFormat)
         Storage.saveSalaryReceiptDay(salaryReceiptDay)
         Storage.saveCheckingBalance(checkingBalance)
     }
@@ -1348,12 +1525,20 @@ struct ContentView: View {
         }
     }
 
+    private func refreshDateFormatUI() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            rootRefreshID = UUID()
+        }
+    }
+
     private func resetAppWithSnapshot() {
-        let snapshot = RestoreSnapshot(
+        Storage.appendRestoreSnapshot(RestoreSnapshot(
             createdAt: Date(),
             expenses: expenses,
             recurringExpenses: recurringExpenses,
             savings: Storage.loadSavings(),
+            savingGoals: Storage.loadSavingGoals(),
+            recurringSavings: Storage.loadRecurringSavings(),
             debts: Storage.loadDebts(),
             salaryEntries: salaryEntries,
             categories: categories,
@@ -1364,28 +1549,63 @@ struct ContentView: View {
             salaryReceiptDay: salaryReceiptDay,
             checkingBalance: checkingBalance,
             savingsGoal: Storage.loadSavingsGoal()
-        )
-        Storage.appendRestoreSnapshot(snapshot)
+        ))
 
+        Storage.resetAllAppData()
+
+        amountText = ""
         expenses = []
         recurringExpenses = []
         salaryEntries = []
         categories = ExpenseCategory.placeholderCategories
         deletedCategoryBuckets = []
         currentCategoryIndex = 0
+        appTheme = .system
+        userName = ""
+        currency = .ils
+        dateDisplayFormat = .dayMonthYear
+        salaryReceiptDay = 1
         checkingBalance = nil
-
-        Storage.saveExpenses(expenses)
-        Storage.saveRecurringExpenses(recurringExpenses)
-        Storage.saveSavings([])
-        Storage.saveDebts([])
-        Storage.saveSalaryEntries(salaryEntries)
-        Storage.saveCategories(categories)
-        Storage.saveDeletedCategoryBuckets(deletedCategoryBuckets)
-        Storage.saveSavingsGoal(nil)
-        Storage.saveSavingGoals([])
-        Storage.saveRecurringSavings([])
-        Storage.saveCheckingBalance(nil)
+        isUserNamePromptPresented = false
+        isSalaryPromptPresented = false
+        didSkipSalaryPromptThisSession = false
+        isSideMenuOpen = false
+        selectedMenuOption = nil
+        pendingExpense = nil
+        expenseName = ""
+        isNamingSheetPresented = false
+        newCategoryName = ""
+        newCategorySystemImageName = CategoryAppearanceOption.defaultSystemImageName
+        newCategoryTintName = CategoryAppearanceOption.defaultTintName
+        categoryNameError = nil
+        isCategorySheetPresented = false
+        isManageCategoriesPresented = false
+        isSettingsPresented = false
+        isAddExpensePresented = false
+        mainAddExpenseIsRecurring = false
+        isMainAddSelectorPresented = false
+        mainSelectedAddAction = nil
+        isMainAddTypeSelectorPresented = false
+        isMainAddSavingPresented = false
+        isMainRecurringSavingPresented = false
+        isMainAddDebtDirectionPresented = false
+        isMainAddDebtPresented = false
+        mainAddDebtDirection = .owedToMe
+        mainAlertMessage = nil
+        isBackfillExpensePresented = false
+        isManageRecurringExpensesPresented = false
+        isPastExpensesPresented = false
+        isSalaryHistoryPresented = false
+        isAnalyticsPresented = false
+        categoryForMonthlyDetails = nil
+        isSavingsManagementPresented = false
+        isDebtsManagementPresented = false
+        categoryTransitionDirection = -1
+        isNavigatingCategory = false
+        categoryNavigationLockID = 0
+        appSettings.language = .en
+        isInitialSetupPresented = true
+        rootRefreshID = UUID()
     }
 
     private func restoreSnapshot(_ snapshot: RestoreSnapshot) {
@@ -1404,6 +1624,8 @@ struct ContentView: View {
         Storage.saveExpenses(expenses)
         Storage.saveRecurringExpenses(recurringExpenses)
         Storage.saveSavings(snapshot.savings)
+        Storage.saveSavingGoals(snapshot.savingGoals)
+        Storage.saveRecurringSavings(snapshot.recurringSavings)
         Storage.saveDebts(snapshot.debts)
         Storage.saveSalaryEntries(salaryEntries)
         Storage.saveCategories(categories)
@@ -1414,6 +1636,23 @@ struct ContentView: View {
         Storage.saveSalaryReceiptDay(salaryReceiptDay)
         Storage.saveCheckingBalance(checkingBalance)
         Storage.saveSavingsGoal(snapshot.savingsGoal)
+        Storage.saveInitialSetupCompleted(true)
+    }
+
+    private func completeInitialSetup(name: String, language: AppLanguage) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isValidSetupUserName(trimmedName) else {
+            return
+        }
+
+        userName = trimmedName
+        appSettings.language = language
+        Storage.saveUserName(trimmedName)
+        Storage.saveAppLanguage(language)
+        Storage.saveInitialSetupCompleted(true)
+        isInitialSetupPresented = false
+        rootRefreshID = UUID()
+        presentSalaryPromptIfNeeded()
     }
 
     private func createDebugTestData() {
@@ -1481,10 +1720,15 @@ struct ContentView: View {
         appTheme = Storage.loadAppTheme()
         userName = Storage.loadUserName() ?? ""
         currency = Storage.loadCurrency()
+        mainSelectedCurrency = Storage.loadTemporaryCurrency(primaryCurrency: currency)
+        temporaryCurrencyStartDate = Storage.loadTemporaryCurrencyStartDate()
+        temporaryCurrencyExpirationDate = Storage.loadTemporaryCurrencyExpirationDate()
+        dateDisplayFormat = Storage.loadDateDisplayFormat()
         appSettings.language = Storage.loadAppLanguage()
         salaryReceiptDay = Storage.loadSalaryReceiptDay()
         checkingBalance = Storage.loadCheckingBalance()
-        isUserNamePromptPresented = userName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        isInitialSetupPresented = !Storage.isInitialSetupCompleted() || !isValidSetupUserName(userName)
+        isUserNamePromptPresented = false
     }
 }
 
@@ -1788,7 +2032,7 @@ private struct ExpenseNameView: View {
             TextField(appLanguage.text(he: "לדוגמה: קפה, סופר, דלק", en: "Example: coffee, groceries, fuel"), text: $expenseName)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.title3)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -1837,7 +2081,7 @@ private struct AddCategoryView: View {
             TextField(appLanguage.text(he: "לדוגמה: אוכל בחוץ", en: "Example: eating out"), text: $categoryName)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.title3)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -1854,6 +2098,7 @@ private struct AddCategoryView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -1908,7 +2153,7 @@ private struct UserNamePromptView: View {
             TextField(appLanguage.text(he: "שם משתמש", en: "User name"), text: $name)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.headline)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -1927,10 +2172,94 @@ private struct UserNamePromptView: View {
     }
 }
 
+private struct FirstLaunchSetupView: View {
+    let initialLanguage: AppLanguage
+    let onComplete: (String, AppLanguage) -> Void
+
+    @State private var name = ""
+    @State private var selectedLanguage: AppLanguage
+
+    init(initialLanguage: AppLanguage, onComplete: @escaping (String, AppLanguage) -> Void) {
+        self.initialLanguage = initialLanguage
+        self.onComplete = onComplete
+        _selectedLanguage = State(initialValue: initialLanguage)
+    }
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var titleText: String {
+        selectedLanguage.text(he: "איך קוראים לך?", en: "What is your name?")
+    }
+
+    private var isNameValid: Bool {
+        isValidSetupUserName(name)
+    }
+
+    private var shouldShowNameValidation: Bool {
+        !trimmedName.isEmpty && !isNameValid
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: selectedLanguage.horizontalAlignment, spacing: 18) {
+                Spacer(minLength: 24)
+
+                Text(titleText)
+                    .font(.title2.bold())
+                    .frame(maxWidth: .infinity, alignment: .center)
+
+                TextField(selectedLanguage.text(he: "שם", en: "Name"), text: $name)
+                    .textInputAutocapitalization(.words)
+                    .localizedTextInput(selectedLanguage)
+                    .font(.headline)
+                    .padding(.vertical, 12)
+                    .padding(.horizontal, 14)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+                if shouldShowNameValidation {
+                    Text(selectedLanguage.text(he: "יש להזין שם כדי להמשיך", en: "Please enter a name to continue"))
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: selectedLanguage.frameAlignment)
+                }
+
+                VStack(alignment: selectedLanguage.horizontalAlignment, spacing: 10) {
+                    Text(selectedLanguage.text(he: "בחר שפה", en: "Choose Language"))
+                        .font(.headline)
+
+                    Picker(selectedLanguage.text(he: "בחר שפה", en: "Choose Language"), selection: $selectedLanguage) {
+                        Text("עברית").tag(AppLanguage.he)
+                        Text("English").tag(AppLanguage.en)
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                Button(selectedLanguage.text(he: "המשך", en: "Continue")) {
+                    onComplete(trimmedName, selectedLanguage)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!isNameValid)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 6)
+
+                Spacer()
+            }
+            .padding(24)
+            .navigationTitle(selectedLanguage.text(he: "התחלה", en: "Setup"))
+        }
+        .environment(\.appLanguage, selectedLanguage)
+        .environment(\.layoutDirection, selectedLanguage.layoutDirection)
+        .environment(\.locale, Locale(identifier: selectedLanguage.localeIdentifier))
+    }
+}
+
 private struct SettingsView: View {
     let userName: String
     @Binding var currency: CurrencyOption
     @Binding var appLanguage: AppLanguage
+    @Binding var dateDisplayFormat: DateDisplayFormat
     @Binding var salaryReceiptDay: Int
     @Binding var checkingBalance: Decimal?
     let onSaveUserName: (String) -> Void
@@ -1972,7 +2301,7 @@ private struct SettingsView: View {
                     }
 
                     Section(appLanguage.text(he: "העדפות", en: "Preferences")) {
-                        Picker(appLanguage.text(he: "מטבע", en: "Currency"), selection: $currency) {
+                        Picker(appLanguage.text(he: "מטבע ראשי", en: "Primary Currency"), selection: $currency) {
                             ForEach(CurrencyOption.allCases) { currency in
                                 Text(currency.title(for: appLanguage)).tag(currency)
                             }
@@ -1990,12 +2319,21 @@ private struct SettingsView: View {
                             onPersistSettings()
                             showLanguageRefreshOverlay()
                         }
+
+                        Picker(appLanguage.text(he: "פורמט תאריך", en: "Date Format"), selection: $dateDisplayFormat) {
+                            ForEach(DateDisplayFormat.allCases) { format in
+                                Text(format.title(for: appLanguage)).tag(format)
+                            }
+                        }
+                        .onChange(of: dateDisplayFormat) {
+                            onPersistSettings()
+                        }
                     }
 
                     Section(appLanguage.text(he: "תלוש ועו״ש", en: "Salary and checking")) {
                         Picker(appLanguage.text(he: "תאריך קבלת תלוש", en: "Salary receipt day"), selection: $salaryReceiptDay) {
                             ForEach(1...31, id: \.self) { day in
-                                Text("\(day)").tag(day)
+                                Text(day.salaryReceiptDayTitle(for: appLanguage, dateDisplayFormat: dateDisplayFormat)).tag(day)
                             }
                         }
                         .onChange(of: salaryReceiptDay) {
@@ -2081,7 +2419,10 @@ private struct SettingsView: View {
 
             Button(appLanguage.text(he: "ביטול", en: "Cancel"), role: .cancel) {}
         } message: {
-            Text(appLanguage.text(he: "הנתונים יועברו לשחזור לפי תאריך ושעה ולא יוצגו באפליקציה.", en: "The data will be archived for restore by date and time and will not be shown in the app."))
+            Text(appLanguage.text(
+                he: "איפוס האפליקציה ימחק את כל הנתונים ויחזיר את האפליקציה להתחלה.",
+                en: "Resetting the app will delete all data and return the app to the initial setup."
+            ))
         }
         .alert(
             appLanguage.text(he: "האפליקציה אופסה בהצלחה", en: "App reset successfully"),
@@ -2266,6 +2607,7 @@ private struct CheckingBalanceEditorView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -2331,6 +2673,7 @@ private struct SalaryPromptView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -2627,18 +2970,29 @@ private struct SavingsManagementView: View {
     @State private var savingFormKind: SavingKind = .deposit
     @State private var savingsGoal: Decimal?
     @State private var isSavingsGoalEditorPresented = false
+    @State private var selectedBreakdownGoal: SavingGoal?
+    @State private var selectedHistoryMonth = Date()
 
     private var savingsBalance: Decimal {
         Saving.balance(for: savings)
     }
 
+    private var availableWithdrawalSourceOptions: [SavingSourceOption] {
+        SavingSourceOption.options(from: savings, goalId: nil, language: appLanguage)
+    }
+
     private var hasWithdrawalSources: Bool {
-        SavingLocation.withdrawalOptions.contains { Saving.hasPositiveBalance(for: savings, location: $0) }
-            || savingGoals.contains { Saving.balance(for: savings, goalId: $0.id) > 0 }
+        !availableWithdrawalSourceOptions.isEmpty
     }
 
     private var activeSavingGoals: [SavingGoal] {
         savingGoals.filter(\.isActive)
+    }
+
+    private var savingsForSelectedHistoryMonth: [Saving] {
+        savings
+            .filter { Calendar.current.isDate($0.date, equalTo: selectedHistoryMonth, toGranularity: .month) }
+            .sorted { $0.date > $1.date }
     }
 
     private var totalSavingGoalTargets: Decimal {
@@ -2711,7 +3065,6 @@ private struct SavingsManagementView: View {
                     Text(headerText)
                         .font(.headline)
                         .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-                        .multilineTextAlignment(appLanguage.textAlignment)
                         .padding(.vertical, 6)
 
                     if let savingGoalsProgressText {
@@ -2719,7 +3072,6 @@ private struct SavingsManagementView: View {
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-                            .multilineTextAlignment(appLanguage.textAlignment)
                     } else {
                         Text(appLanguage.text(he: "אין יעדי חסכון עדיין", en: "No saving goals yet"))
                             .font(.subheadline.weight(.semibold))
@@ -2728,19 +3080,25 @@ private struct SavingsManagementView: View {
                     }
                 }
 
-                if hasWithdrawalSources {
-                    Section {
-                        Button {
-                            savingFormKind = .withdrawal
-                            isAddSavingPresented = true
-                        } label: {
-                            Label(appLanguage.text(he: "משיכה מחיסכון", en: "Withdraw from Savings"), systemImage: "minus.circle.fill")
-                                .font(.headline)
-                                .frame(maxWidth: .infinity, alignment: .center)
-                                .padding(.vertical, 10)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(.red)
+                Section {
+                    Button {
+                        savingFormKind = .withdrawal
+                        isAddSavingPresented = true
+                    } label: {
+                        Label(appLanguage.text(he: "משיכה מחיסכון", en: "Withdraw from Savings"), systemImage: "minus.circle.fill")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                    .disabled(!hasWithdrawalSources)
+
+                    if !hasWithdrawalSources {
+                        Text(appLanguage.text(he: "אין חסכונות זמינים למשיכה", en: "No savings available to withdraw"))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
                     }
                 }
 
@@ -2765,7 +3123,10 @@ private struct SavingsManagementView: View {
                         ForEach(savingGoals) { goal in
                             SavingGoalRow(
                                 goal: goal,
-                                savedAmount: Saving.balance(for: savings, goalId: goal.id)
+                                savedAmount: Saving.balance(for: savings, goalId: goal.id),
+                                onShowBreakdown: {
+                                    selectedBreakdownGoal = goal
+                                }
                             )
                         }
                     }
@@ -2785,12 +3146,17 @@ private struct SavingsManagementView: View {
                     }
                 }
 
-                Section {
-                    if savings.isEmpty {
-                        Text(appLanguage.text(he: "אין חסכונות עדיין", en: "No savings yet"))
+                Section(appLanguage.text(he: "היסטוריית חסכונות", en: "Savings History")) {
+                    MonthNavigationView(
+                        selectedMonth: $selectedHistoryMonth,
+                        maximumMonth: Date()
+                    )
+
+                    if savingsForSelectedHistoryMonth.isEmpty {
+                        Text(appLanguage.text(he: "אין פעולות חיסכון בחודש זה", en: "No savings activity this month"))
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(savings) { saving in
+                        ForEach(savingsForSelectedHistoryMonth) { saving in
                             SavingRow(
                                 saving: saving,
                                 goal: savingGoals.first { $0.id == saving.goalId }
@@ -2840,7 +3206,7 @@ private struct SavingsManagementView: View {
                 }
             )
             .localizedPresentationEnvironment(appLanguage)
-            .presentationDetents([.height(620)])
+            .presentationDetents([.height(430)])
         }
         .sheet(isPresented: $isAddSavingGoalPresented) {
             SavingGoalEditorView(
@@ -2873,6 +3239,17 @@ private struct SavingsManagementView: View {
             )
             .localizedPresentationEnvironment(appLanguage)
             .presentationDetents([.height(260)])
+        }
+        .sheet(item: $selectedBreakdownGoal) { goal in
+            SavingGoalBreakdownView(
+                goal: goal,
+                savings: savings,
+                onClose: {
+                    selectedBreakdownGoal = nil
+                }
+            )
+            .localizedPresentationEnvironment(appLanguage)
+            .presentationDetents([.height(420)])
         }
     }
 
@@ -2949,6 +3326,7 @@ private struct SavingsGoalEditorView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -2989,6 +3367,7 @@ private struct SavingGoalRow: View {
 
     let goal: SavingGoal
     let savedAmount: Decimal
+    let onShowBreakdown: () -> Void
 
     private var progressText: String {
         guard goal.targetAmount > 0 else {
@@ -3009,6 +3388,15 @@ private struct SavingGoalRow: View {
                 Text(progressText)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
+
+                Button {
+                    onShowBreakdown()
+                } label: {
+                    Image(systemName: "eye")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(appLanguage.text(he: "הצג פירוט יעד חיסכון", en: "Show Saving Goal Breakdown"))
             }
 
             ProgressView(value: min(NSDecimalNumber(decimal: savedAmount / max(goal.targetAmount, 1)).doubleValue, 1))
@@ -3024,6 +3412,220 @@ private struct SavingGoalRow: View {
                 .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
         }
         .padding(.vertical, 4)
+    }
+}
+
+private struct SavingSourceOption: Identifiable {
+    let id: String
+    let title: String
+    let amount: Decimal
+    let location: SavingLocation
+    let customLocation: String
+    let goalId: UUID?
+
+    static func options(from savings: [Saving], goalId: UUID?, language: AppLanguage) -> [SavingSourceOption] {
+        var totals: [String: (title: String, amount: Decimal, location: SavingLocation, customLocation: String, goalId: UUID?)] = [:]
+
+        for saving in savings where goalId == nil || saving.goalId == goalId {
+            let identity = sourceIdentity(for: saving, language: language)
+            let signedAmount = saving.kind == .withdrawal ? -saving.amount : saving.amount
+            let current = totals[identity.id]?.amount ?? 0
+            totals[identity.id] = (
+                title: identity.title,
+                amount: current + signedAmount,
+                location: identity.location,
+                customLocation: identity.customLocation,
+                goalId: identity.goalId
+            )
+        }
+
+        return totals.values
+            .filter { $0.amount > 0 }
+            .map {
+                SavingSourceOption(
+                    id: sourceKey(location: $0.location, customLocation: $0.customLocation, goalId: $0.goalId),
+                    title: $0.title,
+                    amount: $0.amount,
+                    location: $0.location,
+                    customLocation: $0.customLocation,
+                    goalId: $0.goalId
+                )
+            }
+            .sorted {
+                if $0.amount == $1.amount {
+                    return $0.title < $1.title
+                }
+
+                return $0.amount > $1.amount
+            }
+    }
+
+    private static func sourceIdentity(for saving: Saving, language: AppLanguage) -> (id: String, title: String, location: SavingLocation, customLocation: String, goalId: UUID?) {
+        let trimmedCustomLocation = saving.customLocation.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if saving.location == .other {
+            guard !trimmedCustomLocation.isEmpty else {
+                return (
+                    id: sourceKey(location: saving.location, customLocation: "", goalId: saving.goalId),
+                    title: language.text(he: "לא צוין מקור", en: "Unspecified Source"),
+                    location: saving.location,
+                    customLocation: "",
+                    goalId: saving.goalId
+                )
+            }
+
+            return (
+                id: sourceKey(location: saving.location, customLocation: trimmedCustomLocation, goalId: saving.goalId),
+                title: trimmedCustomLocation,
+                location: saving.location,
+                customLocation: trimmedCustomLocation,
+                goalId: saving.goalId
+            )
+        }
+
+        return (
+            id: sourceKey(location: saving.location, customLocation: "", goalId: saving.goalId),
+            title: saving.location.title(for: language),
+            location: saving.location,
+            customLocation: "",
+            goalId: saving.goalId
+        )
+    }
+
+    private static func sourceKey(location: SavingLocation, customLocation: String, goalId: UUID?) -> String {
+        let trimmedCustomLocation = customLocation.trimmingCharacters(in: .whitespacesAndNewlines)
+        let goalComponent = goalId?.uuidString ?? "general"
+
+        if location == .other {
+            return trimmedCustomLocation.isEmpty
+                ? "source:\(goalComponent):unspecified"
+                : "source:\(goalComponent):custom:\(trimmedCustomLocation)"
+        }
+
+        return "source:\(goalComponent):location:\(location.rawValue)"
+    }
+}
+
+private struct SavingGoalBreakdownView: View {
+    @Environment(\.appLanguage) private var appLanguage
+
+    let goal: SavingGoal
+    let savings: [Saving]
+    let onClose: () -> Void
+
+    private var goalSavings: [Saving] {
+        savings.filter { $0.goalId == goal.id }
+    }
+
+    private var savedTotal: Decimal {
+        sourceBreakdown.reduce(Decimal(0)) { $0 + $1.amount }
+    }
+
+    private var remainingAmount: Decimal {
+        max(goal.targetAmount - savedTotal, 0)
+    }
+
+    private var progressPercent: Decimal {
+        guard goal.targetAmount > 0 else {
+            return 0
+        }
+
+        return savedTotal / goal.targetAmount * 100
+    }
+
+    private var sourceBreakdown: [SavingSourceOption] {
+        SavingSourceOption.options(from: savings, goalId: goal.id, language: appLanguage)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    VStack(alignment: appLanguage.horizontalAlignment, spacing: 8) {
+                        Text(goal.name)
+                            .font(.headline)
+                            .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Section(appLanguage.text(he: "סיכום", en: "Summary")) {
+                    SavingGoalBreakdownSummaryRow(
+                        title: appLanguage.text(he: "סך הכל נחסך", en: "Total saved"),
+                        value: savedTotal.formattedShekelAmount,
+                        appLanguage: appLanguage
+                    )
+                    SavingGoalBreakdownSummaryRow(
+                        title: appLanguage.text(he: "סכום יעד", en: "Goal target"),
+                        value: goal.targetAmount.formattedShekelAmount,
+                        appLanguage: appLanguage
+                    )
+                    SavingGoalBreakdownSummaryRow(
+                        title: appLanguage.text(he: "נותר ליעד", en: "Remaining to goal"),
+                        value: remainingAmount.formattedShekelAmount,
+                        appLanguage: appLanguage
+                    )
+                    SavingGoalBreakdownSummaryRow(
+                        title: appLanguage.text(he: "התקדמות", en: "Progress"),
+                        value: progressPercent.formattedPercentText,
+                        appLanguage: appLanguage
+                    )
+                }
+
+                Section(appLanguage.text(he: "פירוט חסכונות", en: "Savings Breakdown")) {
+                    if sourceBreakdown.isEmpty {
+                        Text(appLanguage.text(
+                            he: "עדיין אין חסכונות משויכים ליעד הזה",
+                            en: "No savings are linked to this goal yet"
+                        ))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
+                    } else {
+                        ForEach(sourceBreakdown) { source in
+                            SavingGoalBreakdownSummaryRow(
+                                title: source.title,
+                                value: source.amount.formattedShekelAmount,
+                                appLanguage: appLanguage
+                            )
+                        }
+                    }
+                }
+            }
+            .navigationTitle(appLanguage.text(he: "פירוט חסכונות", en: "Savings Breakdown"))
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(appLanguage.text(he: "סגור", en: "Close")) {
+                        onClose()
+                    }
+                }
+            }
+        }
+        .environment(\.layoutDirection, appLanguage.layoutDirection)
+        .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
+    }
+}
+
+private struct SavingGoalBreakdownSummaryRow: View {
+    let title: String
+    let value: String
+    let appLanguage: AppLanguage
+
+    var body: some View {
+        HStack {
+            if appLanguage == .he {
+                Text(value)
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(title)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(title)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(value)
+                    .font(.subheadline.weight(.semibold))
+            }
+        }
     }
 }
 
@@ -3079,7 +3681,7 @@ private struct SavingGoalEditorView: View {
             TextField(appLanguage.text(he: "שם היעד", en: "Goal Name"), text: $name)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.headline)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -3113,7 +3715,7 @@ private struct SavingGoalEditorView: View {
                 TextField(appLanguage.text(he: "איפה הכסף נמצא", en: "Where the money is held"), text: $customLocation)
                     .keyboardType(.default)
                     .textInputAutocapitalization(.never)
-                    .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                     .font(.headline)
                     .padding(.vertical, 9)
                     .padding(.horizontal, 14)
@@ -3123,6 +3725,7 @@ private struct SavingGoalEditorView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -3231,6 +3834,7 @@ private struct RecurringSavingEditorView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -3336,6 +3940,7 @@ private struct AddSavingView: View {
     @State private var date: Date
     @State private var note = ""
     @State private var selectedGoalId: UUID?
+    @State private var selectedWithdrawalSourceKey: String?
     @State private var isRecurring = false
     @State private var errorMessage: String?
 
@@ -3372,7 +3977,8 @@ private struct AddSavingView: View {
             return false
         }
 
-        return kind == .deposit || (hasWithdrawalSources && selectedAvailableBalance > 0 && parsedAmount <= selectedAvailableBalance)
+        return kind == .deposit
+            || (hasWithdrawalSources && selectedWithdrawalSourceKey != nil && selectedAvailableBalance > 0 && parsedAmount <= selectedAvailableBalance)
     }
 
     private var validationMessage: String? {
@@ -3383,8 +3989,8 @@ private struct AddSavingView: View {
         }
 
         return appLanguage.text(
-            he: "לא ניתן למשוך יותר מהיתרה הזמינה",
-            en: "You cannot withdraw more than the available balance"
+            he: "לא ניתן למשוך יותר מהסכום הזמין",
+            en: "Cannot withdraw more than the available amount"
         )
     }
 
@@ -3396,6 +4002,14 @@ private struct AddSavingView: View {
         return SavingLocation.withdrawalOptions.filter { Saving.hasPositiveBalance(for: savings, location: $0) }
     }
 
+    private var availableWithdrawalSourceOptions: [SavingSourceOption] {
+        SavingSourceOption.options(
+            from: savings,
+            goalId: selectedGoalId,
+            language: appLanguage
+        )
+    }
+
     private var availableGoals: [SavingGoal] {
         guard kind == .withdrawal else {
             return goals
@@ -3405,7 +4019,7 @@ private struct AddSavingView: View {
     }
 
     private var hasWithdrawalSources: Bool {
-        kind != .withdrawal || !availableLocationOptions.isEmpty || !availableGoals.isEmpty
+        kind != .withdrawal || !availableWithdrawalSourceOptions.isEmpty
     }
 
     private var selectedAvailableBalance: Decimal {
@@ -3413,11 +4027,20 @@ private struct AddSavingView: View {
             return availableBalance
         }
 
-        if let selectedGoalId {
-            return Saving.balance(for: savings, goalId: selectedGoalId)
+        guard let selectedWithdrawalSourceKey,
+              let option = availableWithdrawalSourceOptions.first(where: { $0.id == selectedWithdrawalSourceKey }) else {
+            return 0
         }
 
-        return Saving.balance(for: savings, location: location)
+        return option.amount
+    }
+
+    private var selectedWithdrawalSource: SavingSourceOption? {
+        guard let selectedWithdrawalSourceKey else {
+            return nil
+        }
+
+        return availableWithdrawalSourceOptions.first { $0.id == selectedWithdrawalSourceKey }
     }
 
     var body: some View {
@@ -3425,6 +4048,16 @@ private struct AddSavingView: View {
             Text(kind.formTitle(for: appLanguage))
                 .font(.title3.bold())
                 .foregroundStyle(kind == .withdrawal ? .red : .primary)
+
+            if kind == .withdrawal && hasWithdrawalSources {
+                Text(appLanguage.text(
+                    he: "זמין למשיכה: \(selectedAvailableBalance.formattedShekelAmount)",
+                    en: "Available to withdraw: \(selectedAvailableBalance.formattedShekelAmount)"
+                ))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
+            }
 
             VStack(alignment: appLanguage.horizontalAlignment, spacing: 6) {
                 Text(kind == .withdrawal
@@ -3440,21 +4073,33 @@ private struct AddSavingView: View {
             }
 
             if !hasWithdrawalSources {
-                Text(appLanguage.text(he: "אין חסכונות זמינים למשיכה", en: "No savings available for withdrawal"))
+                Text(appLanguage.text(he: "אין חסכונות זמינים למשיכה", en: "No savings available to withdraw"))
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-            } else if kind != .withdrawal || !availableLocationOptions.isEmpty {
+            } else if kind == .withdrawal {
                 VStack(alignment: appLanguage.horizontalAlignment, spacing: 6) {
-                    Text(kind == .withdrawal
-                        ? appLanguage.text(he: "מאיפה למשוך?", en: "Withdraw from")
-                        : appLanguage.text(he: "איפה החסכון?", en: "Where is the saving held?"))
+                    Text(appLanguage.text(he: "מאיפה למשוך?", en: "Withdraw from"))
                         .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
 
-                    Picker(kind == .withdrawal
-                        ? appLanguage.text(he: "מאיפה למשוך?", en: "Withdraw from")
-                        : appLanguage.text(he: "איפה החסכון?", en: "Where is the saving held?"), selection: $location) {
+                    Picker(appLanguage.text(he: "מאיפה למשוך?", en: "Withdraw from"), selection: selectedWithdrawalSourceBinding) {
+                        ForEach(availableWithdrawalSourceOptions) { source in
+                            Text(source.title).tag(Optional(source.id))
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            } else {
+                VStack(alignment: appLanguage.horizontalAlignment, spacing: 6) {
+                    Text(appLanguage.text(he: "איפה החסכון?", en: "Where is the saving held?"))
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
+
+                    Picker(appLanguage.text(he: "איפה החסכון?", en: "Where is the saving held?"), selection: $location) {
                         ForEach(availableLocationOptions) { location in
                             Text(location.title(for: appLanguage)).tag(location)
                         }
@@ -3470,7 +4115,7 @@ private struct AddSavingView: View {
                 TextField(appLanguage.text(he: "איפה החסכון?", en: "Where is the saving held?"), text: $customLocation)
                     .keyboardType(.default)
                     .textInputAutocapitalization(.never)
-                    .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                     .font(.headline)
                     .padding(.vertical, 9)
                     .padding(.horizontal, 14)
@@ -3488,9 +4133,9 @@ private struct AddSavingView: View {
                     Picker(kind == .withdrawal
                         ? appLanguage.text(he: "יעד חסכון", en: "Saving Goal")
                         : appLanguage.text(he: "האם החסכון משויך ליעד?", en: "Is this saving linked to a goal?"), selection: selectedGoalBinding) {
-                        if kind != .withdrawal || !availableLocationOptions.isEmpty {
+                        if kind != .withdrawal || !availableGoals.isEmpty {
                             Text(kind == .withdrawal
-                                ? appLanguage.text(he: "לפי מיקום", en: "By location")
+                                ? appLanguage.text(he: "כללי", en: "General")
                                 : appLanguage.text(he: "לא, חסכון כללי", en: "No, general saving")).tag(Optional<UUID>.none)
                         }
 
@@ -3505,24 +4150,10 @@ private struct AddSavingView: View {
                 }
             }
 
-            if kind == .withdrawal && hasWithdrawalSources {
-                Text(appLanguage.text(
-                    he: "זמין למשיכה: \(selectedAvailableBalance.formattedShekelAmount)",
-                    en: "Available to withdraw: \(selectedAvailableBalance.formattedShekelAmount)"
-                ))
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-            }
-
-            if allowsRecurring {
+            if allowsRecurring && kind != .withdrawal {
                 Picker(appLanguage.text(he: "סוג חסכון", en: "Saving type"), selection: $isRecurring) {
-                    Text(kind == .withdrawal
-                        ? appLanguage.text(he: "משיכה חד פעמית", en: "One-time withdrawal")
-                        : appLanguage.text(he: "חד פעמי", en: "One-time")).tag(false)
-                    Text(kind == .withdrawal
-                        ? appLanguage.text(he: "משיכה חוזרת", en: "Recurring withdrawal")
-                        : appLanguage.text(he: "חסכון קבוע", en: "Recurring Saving")).tag(true)
+                    Text(appLanguage.text(he: "חד פעמי", en: "One-time")).tag(false)
+                    Text(appLanguage.text(he: "חסכון קבוע", en: "Recurring Saving")).tag(true)
                 }
                 .pickerStyle(.segmented)
             }
@@ -3543,7 +4174,7 @@ private struct AddSavingView: View {
             TextField(appLanguage.text(he: "שם / הערה", en: "Name / note"), text: $note)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.headline)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -3552,6 +4183,7 @@ private struct AddSavingView: View {
             Text(errorMessage ?? validationMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -3569,20 +4201,17 @@ private struct AddSavingView: View {
                         return
                     }
 
+                    guard kind == .deposit || (selectedWithdrawalSource != nil && selectedAvailableBalance > 0) else {
+                        errorMessage = appLanguage.text(he: "אין חסכונות זמינים למשיכה", en: "No savings available to withdraw")
+                        return
+                    }
+
                     guard kind == .deposit || amount <= selectedAvailableBalance else {
                         errorMessage = validationMessage
                         return
                     }
 
                     if isRecurring {
-                        guard kind == .deposit else {
-                            errorMessage = appLanguage.text(
-                                he: "משיכה חוזרת עדיין לא זמינה. אפשר לשמור משיכה חד פעמית כרגע.",
-                                en: "Recurring withdrawal is not available yet. You can save a one-time withdrawal for now."
-                            )
-                            return
-                        }
-
                         guard let onSaveRecurring else {
                             errorMessage = appLanguage.text(he: "לא ניתן לשמור חסכון קבוע כאן", en: "Recurring saving cannot be saved here")
                             return
@@ -3596,14 +4225,18 @@ private struct AddSavingView: View {
                         return
                     }
 
+                    let sourceLocation = selectedWithdrawalSource?.location ?? location
+                    let sourceCustomLocation = selectedWithdrawalSource?.customLocation ?? customLocation.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let savingGoalId = kind == .withdrawal ? selectedWithdrawalSource?.goalId : selectedGoalId
+
                     onSave(Saving(
                         amount: amount,
                         kind: kind,
-                        location: location,
-                        customLocation: customLocation.trimmingCharacters(in: .whitespacesAndNewlines),
+                        location: sourceLocation,
+                        customLocation: sourceCustomLocation,
                         date: date,
                         note: note.trimmingCharacters(in: .whitespacesAndNewlines),
-                        goalId: selectedGoalId,
+                        goalId: savingGoalId,
                         createdAt: Date()
                     ))
                 }
@@ -3620,12 +4253,17 @@ private struct AddSavingView: View {
             normalizeWithdrawalSourceSelection()
         }
         .onChange(of: kind) {
+            if kind == .withdrawal {
+                isRecurring = false
+            }
             normalizeWithdrawalSourceSelection()
         }
         .onChange(of: location) {
             errorMessage = validationMessage
         }
         .onChange(of: selectedGoalId) {
+            selectedWithdrawalSourceKey = nil
+            normalizeWithdrawalSourceSelection()
             errorMessage = validationMessage
         }
     }
@@ -3634,6 +4272,13 @@ private struct AddSavingView: View {
         Binding(
             get: { selectedGoalId },
             set: { selectedGoalId = $0 }
+        )
+    }
+
+    private var selectedWithdrawalSourceBinding: Binding<String?> {
+        Binding(
+            get: { selectedWithdrawalSourceKey },
+            set: { selectedWithdrawalSourceKey = $0 }
         )
     }
 
@@ -3646,12 +4291,17 @@ private struct AddSavingView: View {
             self.selectedGoalId = nil
         }
 
-        if !availableLocationOptions.contains(location),
-           let firstLocation = availableLocationOptions.first {
-            location = firstLocation
-        } else if availableLocationOptions.isEmpty,
-                  let firstGoal = availableGoals.first {
+        if let selectedWithdrawalSourceKey,
+           availableWithdrawalSourceOptions.contains(where: { $0.id == selectedWithdrawalSourceKey }) {
+            return
+        }
+
+        selectedWithdrawalSourceKey = availableWithdrawalSourceOptions.first?.id
+
+        if selectedWithdrawalSourceKey == nil,
+           let firstGoal = availableGoals.first {
             selectedGoalId = firstGoal.id
+            selectedWithdrawalSourceKey = availableWithdrawalSourceOptions.first?.id
         }
     }
 }
@@ -3822,11 +4472,14 @@ private struct DebtRow: View {
             Text(debt.naturalSentence(for: appLanguage))
                 .font(.subheadline.weight(.semibold))
                 .multilineTextAlignment(appLanguage.textAlignment)
+                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
                 .strikethrough(debt.isFullyRepaid)
 
             Text(debt.repaidLine(for: appLanguage))
                 .font(.footnote.weight(.medium))
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(appLanguage.textAlignment)
+                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
                 .strikethrough(debt.isFullyRepaid)
 
             ProgressView(value: debt.repaymentProgress)
@@ -3835,6 +4488,8 @@ private struct DebtRow: View {
             Text(debt.percentageLine(for: appLanguage))
                 .font(.footnote.weight(.medium))
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(appLanguage.textAlignment)
+                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
                 .strikethrough(debt.isFullyRepaid)
 
             Text(appLanguage.text(
@@ -3843,11 +4498,15 @@ private struct DebtRow: View {
             ))
                 .font(.footnote.weight(.medium))
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(appLanguage.textAlignment)
+                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
                 .strikethrough(debt.isFullyRepaid)
 
             Text("\(debt.date.shortDateText(for: appLanguage)) · \(debt.statusText(for: appLanguage))")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(appLanguage.textAlignment)
+                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
                 .strikethrough(debt.isFullyRepaid)
 
             Button(debt.repaidAmount > 0
@@ -3931,7 +4590,7 @@ private struct AddDebtView: View {
             TextField(personLabel, text: $personName)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.headline)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -3953,7 +4612,7 @@ private struct AddDebtView: View {
             TextField(appLanguage.text(he: "על מה?", en: "What for?"), text: $reason)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.headline)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -3972,6 +4631,7 @@ private struct AddDebtView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -4085,6 +4745,7 @@ private struct DebtRepaymentView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             Button(debt.direction == .owedToMe
@@ -4144,16 +4805,36 @@ private struct AmountInputField: View {
     @FocusState private var isFocused: Bool
 
     @Binding var amountText: String
+    var selectedCurrency: Binding<CurrencyOption>?
+    var onCurrencyButtonTapped: (() -> Void)?
     var placeholder: String?
     var height: CGFloat = 52
+
+    init(
+        amountText: Binding<String>,
+        selectedCurrency: Binding<CurrencyOption>? = nil,
+        onCurrencyButtonTapped: (() -> Void)? = nil,
+        placeholder: String? = nil,
+        height: CGFloat = 52
+    ) {
+        _amountText = amountText
+        self.selectedCurrency = selectedCurrency
+        self.onCurrencyButtonTapped = onCurrencyButtonTapped
+        self.placeholder = placeholder
+        self.height = height
+    }
 
     private var shouldShowPlaceholder: Bool {
         amountText.isEmpty && !isFocused
     }
 
+    private var usesCurrencySelector: Bool {
+        selectedCurrency != nil
+    }
+
     var body: some View {
         ZStack {
-            if shouldShowPlaceholder {
+            if shouldShowPlaceholder && !usesCurrencySelector {
                 Text(placeholder ?? appLanguage.text(he: "סכום", en: "Amount"))
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -4163,30 +4844,17 @@ private struct AmountInputField: View {
             }
 
             HStack(spacing: 6) {
-                Text(Storage.loadCurrency().symbol)
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .opacity(shouldShowPlaceholder ? 0 : 1)
-
-                TextField("", text: $amountText)
-                    .keyboardType(.decimalPad)
-                    .textInputAutocapitalization(.never)
-                    .multilineTextAlignment(.center)
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(Color.primary)
-                    .tint(.accentColor)
-                    .focused($isFocused)
-                    .frame(minWidth: 34, idealWidth: textFieldWidth, maxWidth: textFieldWidth)
-                    .onChange(of: amountText) { _, newValue in
-                        let sanitized = sanitizeAmountInput(newValue)
-
-                        if sanitized != newValue {
-                            amountText = sanitized
-                        }
-                    }
+                if appLanguage == .he {
+                    amountTextField
+                    currencyAccessory
+                } else {
+                    currencyAccessory
+                    amountTextField
+                }
             }
             .fixedSize(horizontal: true, vertical: false)
-            .opacity(shouldShowPlaceholder ? 0 : 1)
+            .opacity(shouldShowPlaceholder && !usesCurrencySelector ? 0 : 1)
+            .environment(\.layoutDirection, .leftToRight)
         }
         .padding(.horizontal, 12)
         .frame(maxWidth: .infinity)
@@ -4196,11 +4864,72 @@ private struct AmountInputField: View {
         .onTapGesture {
             isFocused = true
         }
-        .environment(\.layoutDirection, .leftToRight)
         .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
+        .task {
+            if selectedCurrency != nil {
+                await CurrencyExchangeService.refreshIfNeeded()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var currencyAccessory: some View {
+        if let selectedCurrency {
+            Button {
+                onCurrencyButtonTapped?()
+            } label: {
+                Text(selectedCurrency.wrappedValue.symbol)
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 44)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule())
+                    .overlay {
+                        Capsule()
+                            .stroke(Color.secondary.opacity(0.22), lineWidth: 1)
+                    }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(appLanguage.text(he: "בחר מטבע", en: "Choose currency"))
+        } else {
+            Text(Storage.loadCurrency().symbol)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .opacity(shouldShowPlaceholder ? 0 : 1)
+        }
+    }
+
+    private var amountTextField: some View {
+        TextField(textFieldPlaceholder, text: $amountText)
+            .keyboardType(.decimalPad)
+            .textInputAutocapitalization(.never)
+                .localizedTextInput(appLanguage)
+            .multilineTextAlignment(.center)
+            .environment(\.layoutDirection, .leftToRight)
+            .font(.title3.weight(.semibold))
+            .foregroundStyle(Color.primary)
+            .tint(.accentColor)
+            .focused($isFocused)
+            .frame(minWidth: 34, idealWidth: textFieldWidth, maxWidth: textFieldWidth)
+            .onChange(of: amountText) { _, newValue in
+                let sanitized = sanitizeAmountInput(newValue)
+
+                if sanitized != newValue {
+                    amountText = sanitized
+                }
+            }
+    }
+
+    private var textFieldPlaceholder: String {
+        usesCurrencySelector ? (placeholder ?? appLanguage.text(he: "סכום", en: "Amount")) : ""
     }
 
     private var textFieldWidth: CGFloat {
+        if usesCurrencySelector && amountText.isEmpty {
+            return 112
+        }
+
         let characterCount = max(amountText.count, 1)
         return min(142, max(34, CGFloat(characterCount) * 12 + 24))
     }
@@ -4219,6 +4948,321 @@ private struct AmountInputField: View {
         }
 
         return sanitized
+    }
+}
+
+private enum TemporaryCurrencyUsageMode: String, CaseIterable, Identifiable {
+    case currentExpense
+    case dateRange
+
+    var id: String {
+        rawValue
+    }
+
+    func title(for language: AppLanguage) -> String {
+        switch self {
+        case .currentExpense:
+            language.text(he: "להוצאה זו בלבד", en: "This expense only")
+        case .dateRange:
+            language.text(he: "טווח תאריכים", en: "Date range")
+        }
+    }
+}
+
+private struct TemporaryCurrencySheet: View {
+    @Environment(\.appLanguage) private var appLanguage
+
+    let selectedCurrency: CurrencyOption
+    let primaryCurrency: CurrencyOption
+    let onSelectCurrentExpense: (CurrencyOption) -> Void
+    let onSelectDateRange: (CurrencyOption, Date, Date) -> Void
+    let onClose: () -> Void
+
+    @State private var draftCurrency: CurrencyOption?
+    @State private var isCurrencyPickerExpanded = false
+    @State private var usageMode: TemporaryCurrencyUsageMode = .currentExpense
+    @State private var startDate = Date()
+    @State private var endDate = Calendar.current.date(byAdding: .day, value: 7, to: Date()) ?? Date()
+
+    init(
+        selectedCurrency: CurrencyOption,
+        primaryCurrency: CurrencyOption,
+        onSelectCurrentExpense: @escaping (CurrencyOption) -> Void,
+        onSelectDateRange: @escaping (CurrencyOption, Date, Date) -> Void,
+        onClose: @escaping () -> Void
+    ) {
+        self.selectedCurrency = selectedCurrency
+        self.primaryCurrency = primaryCurrency
+        self.onSelectCurrentExpense = onSelectCurrentExpense
+        self.onSelectDateRange = onSelectDateRange
+        self.onClose = onClose
+        _draftCurrency = State(initialValue: selectedCurrency == primaryCurrency ? nil : selectedCurrency)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: appLanguage.horizontalAlignment, spacing: 18) {
+                    Text(appLanguage.text(he: "מטבע זמני", en: "Temporary Currency"))
+                        .font(.title3.bold())
+                        .frame(maxWidth: .infinity, alignment: .center)
+
+                    currencySelectionView
+
+                    if isCurrencyPickerExpanded {
+                        currencyPickerView
+                    }
+
+                    exchangeRateView
+
+                    VStack(alignment: appLanguage.horizontalAlignment, spacing: 12) {
+                        Text(appLanguage.text(he: "משך שימוש", en: "Usage Mode"))
+                            .font(.headline)
+                            .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
+
+                        Picker(appLanguage.text(he: "משך שימוש", en: "Usage Mode"), selection: $usageMode) {
+                            ForEach(TemporaryCurrencyUsageMode.allCases) { mode in
+                                Text(mode.title(for: appLanguage)).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        if usageMode == .dateRange {
+                            VStack(alignment: appLanguage.horizontalAlignment, spacing: 10) {
+                                DatePicker(appLanguage.text(he: "מתאריך", en: "Start Date"), selection: $startDate, displayedComponents: .date)
+                                    .datePickerStyle(.compact)
+
+                                DatePicker(appLanguage.text(he: "עד תאריך", en: "End Date"), selection: $endDate, in: startDate..., displayedComponents: .date)
+                                    .datePickerStyle(.compact)
+                            }
+                            .padding(12)
+                            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+
+                        Button {
+                            guard let draftCurrency else {
+                                isCurrencyPickerExpanded = true
+                                return
+                            }
+
+                            if usageMode == .currentExpense {
+                                onSelectCurrentExpense(draftCurrency)
+                            } else {
+                                onSelectDateRange(draftCurrency, startDate, endDate)
+                            }
+                        } label: {
+                            Text(primaryActionTitle)
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(draftCurrency == nil)
+                    }
+                    .padding(14)
+                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                    Text(appLanguage.text(
+                        he: "המטבע הראשי נשאר \(primaryCurrency.code). המטבע הזמני חל רק על הוצאות ממסך הבית.",
+                        en: "Your primary currency remains \(primaryCurrency.code). The temporary currency applies only to Home-screen expenses."
+                    ))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                }
+                .padding(20)
+            }
+            .navigationTitle(appLanguage.text(he: "בחר מטבע", en: "Choose Currency"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(appLanguage.text(he: "סגור", en: "Close")) {
+                        onClose()
+                    }
+                }
+            }
+        }
+        .environment(\.layoutDirection, appLanguage.layoutDirection)
+        .onChange(of: startDate) { _, newValue in
+            if endDate < newValue {
+                endDate = newValue
+            }
+        }
+    }
+
+    private var availableTemporaryCurrencies: [CurrencyOption] {
+        CurrencyOption.allCases.filter { $0 != primaryCurrency }
+    }
+
+    private var primaryActionTitle: String {
+        switch usageMode {
+        case .currentExpense:
+            appLanguage.text(he: "השתמש להוצאה זו", en: "Use for This Expense")
+        case .dateRange:
+            appLanguage.text(he: "הפעל לטווח", en: "Apply Range")
+        }
+    }
+
+    private var currencySelectionView: some View {
+        HStack(spacing: 10) {
+            if appLanguage == .he {
+                temporaryCurrencyField
+                Image(systemName: "arrow.left")
+                    .foregroundStyle(.secondary)
+                currencySummaryBox(
+                    title: appLanguage.text(he: "מטבע ראשי", en: "Primary Currency"),
+                    currency: primaryCurrency
+                )
+            } else {
+                currencySummaryBox(
+                    title: appLanguage.text(he: "מטבע ראשי", en: "Primary Currency"),
+                    currency: primaryCurrency
+                )
+                Image(systemName: "arrow.right")
+                    .foregroundStyle(.secondary)
+                temporaryCurrencyField
+            }
+        }
+        .environment(\.layoutDirection, .leftToRight)
+    }
+
+    private var temporaryCurrencyField: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                isCurrencyPickerExpanded.toggle()
+            }
+        } label: {
+            VStack(spacing: 6) {
+                Text(appLanguage.text(he: "מטבע זמני", en: "Temporary Currency"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 6) {
+                    if let draftCurrency {
+                        Text(draftCurrency.symbol)
+                            .font(.headline.weight(.bold))
+                        Text(draftCurrency.code)
+                            .font(.subheadline.weight(.semibold))
+                    } else {
+                        Text(appLanguage.text(he: "בחר מטבע", en: "Select Currency"))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity)
+            .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.accentColor.opacity(0.35), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func currencySummaryBox(title: String, currency: CurrencyOption) -> some View {
+        VStack(spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 6) {
+                Text(currency.symbol)
+                    .font(.headline.weight(.bold))
+                Text(currency.code)
+                    .font(.subheadline.weight(.semibold))
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var currencyPickerView: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(availableTemporaryCurrencies) { currency in
+                    Button {
+                        draftCurrency = currency
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            isCurrencyPickerExpanded = false
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Text(currency.symbol)
+                                .font(.headline.weight(.bold))
+                                .frame(width: 34)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(currency.code)
+                                    .font(.subheadline.weight(.bold))
+                                Text(currency.title(for: appLanguage))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer()
+
+                            if draftCurrency == currency {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+
+                    if currency.id != availableTemporaryCurrencies.last?.id {
+                        Divider()
+                            .padding(.leading, 58)
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: 210)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .environment(\.layoutDirection, .leftToRight)
+    }
+
+    private var exchangeRateView: some View {
+        VStack(spacing: 6) {
+            Text(appLanguage.text(he: "שער המרה", en: "Exchange Rate"))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            if let draftCurrency {
+                Text("\(primaryCurrency.code) → \(draftCurrency.code)")
+                    .font(.subheadline.weight(.bold))
+
+                if let conversion = CurrencyExchangeService.convert(amount: 1, from: draftCurrency, to: primaryCurrency) {
+                    Text("1 \(draftCurrency.code) = \(conversion.convertedAmount.plainString) \(primaryCurrency.code)")
+                        .font(.headline)
+                } else {
+                    Text(appLanguage.text(he: "שער לא זמין", en: "Exchange rate unavailable"))
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text(appLanguage.text(he: "לא נבחר מטבע זמני", en: "No temporary currency selected"))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(12)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .environment(\.layoutDirection, .leftToRight)
     }
 }
 
@@ -4278,7 +5322,7 @@ private struct ManageRecurringExpensesView: View {
                     TextField(appLanguage.text(he: "חיפוש לפי שם פעולה חוזרת", en: "Search recurring item name"), text: $searchText)
                         .keyboardType(.default)
                         .textInputAutocapitalization(.never)
-                        .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 }
 
                 if !searchResults.isEmpty {
@@ -4546,7 +5590,7 @@ private struct RecurringCategoryGroupRow: View {
             .accessibilityLabel(appLanguage.text(he: "פירוט הוצאות חוזרות", en: "Recurring expense details"))
         }
         .padding(.vertical, 6)
-        .environment(\.layoutDirection, .leftToRight)
+        .environment(\.layoutDirection, appLanguage.layoutDirection)
     }
 }
 
@@ -4840,6 +5884,7 @@ private struct AnalyticsCategoryBreakdown: Identifiable {
     let percentage: Decimal
     let color: Color
     let monthlyTarget: Decimal?
+    let monthlyAverage: Decimal?
 
     var overBudgetAmount: Decimal {
         guard let monthlyTarget, monthlyTarget > 0, amount > monthlyTarget else {
@@ -4886,6 +5931,53 @@ private struct AnalyticsCategoryBreakdown: Identifiable {
     }
 }
 
+private struct MonthlyAnalyticsSnapshot: Identifiable, Codable {
+    let id: String
+    let month: Date
+    let income: Decimal
+    let expenses: Decimal
+    let netSavings: Decimal
+    let netBalance: Decimal
+    let owedToMe: Decimal
+    let iOwe: Decimal
+    let repaidDebts: Decimal
+    let expenseCount: Int
+    let categoryTotals: [String: Decimal]
+    let categoryNames: [String: String]
+    let sourceSignature: String
+    let updatedAt: Date
+
+    var openDebt: Decimal {
+        owedToMe + iOwe
+    }
+}
+
+private struct AnalyticsMonthlyAverages {
+    let expenses: Decimal
+    let income: Decimal
+    let netSavings: Decimal
+    let openDebt: Decimal
+    let cashFlow: Decimal
+
+    init(metrics: [AnalyticsMonthMetrics]) {
+        guard !metrics.isEmpty else {
+            expenses = 0
+            income = 0
+            netSavings = 0
+            openDebt = 0
+            cashFlow = 0
+            return
+        }
+
+        let monthCount = Decimal(metrics.count)
+        expenses = metrics.reduce(Decimal(0)) { $0 + $1.expenses } / monthCount
+        income = metrics.reduce(Decimal(0)) { $0 + $1.income } / monthCount
+        netSavings = metrics.reduce(Decimal(0)) { $0 + $1.netSavings } / monthCount
+        openDebt = metrics.reduce(Decimal(0)) { $0 + $1.openDebt } / monthCount
+        cashFlow = metrics.reduce(Decimal(0)) { $0 + $1.netBalance } / monthCount
+    }
+}
+
 private struct AnalyticsMonthMetrics: Identifiable {
     let month: Date
     let income: Decimal
@@ -4905,6 +5997,10 @@ private struct AnalyticsMonthMetrics: Identifiable {
 
     var id: Date {
         month
+    }
+
+    var openDebt: Decimal {
+        owedToMe + iOwe
     }
 }
 
@@ -4935,12 +6031,28 @@ private struct AnalyticsView: View {
             .map { metrics(for: $0) }
     }
 
+    private var trendAverages: AnalyticsMonthlyAverages {
+        AnalyticsMonthlyAverages(metrics: trendMetrics)
+    }
+
+    private var trendCategoryAverages: [String: Decimal] {
+        categoryAverages(from: trendMetrics)
+    }
+
     private var recentSixMonthMetrics: [AnalyticsMonthMetrics] {
         let month = startOfMonth(selectedMonth)
         return (0..<6)
             .reversed()
             .compactMap { Calendar.current.date(byAdding: .month, value: -$0, to: month) }
             .map { metrics(for: $0) }
+    }
+
+    private var recentSixMonthAverages: AnalyticsMonthlyAverages {
+        AnalyticsMonthlyAverages(metrics: recentSixMonthMetrics)
+    }
+
+    private var recentSixMonthCategoryAverages: [String: Decimal] {
+        categoryAverages(from: recentSixMonthMetrics)
     }
 
     var body: some View {
@@ -4995,7 +6107,7 @@ private struct AnalyticsView: View {
 
     private var overviewContent: some View {
         VStack(alignment: appLanguage.horizontalAlignment, spacing: 18) {
-            analyticsCards(for: selectedMetrics)
+            analyticsCards(for: selectedMetrics, averages: trendAverages)
 
             AnalyticsGoalProgressView(
                 title: appLanguage.text(he: "חיסכון חודשי", en: "Monthly Savings"),
@@ -5032,13 +6144,13 @@ private struct AnalyticsView: View {
             )
 
             AnalyticsCategoryGraphView(
-                breakdown: selectedMetrics.categoryBreakdown,
+                breakdown: categoryBreakdown(selectedMetrics.categoryBreakdown, applying: trendCategoryAverages),
                 chartKind: $categoryChartKind,
                 appLanguage: appLanguage
             )
 
             AnalyticsCategoryRankingView(
-                breakdown: selectedMetrics.categoryBreakdown,
+                breakdown: categoryBreakdown(selectedMetrics.categoryBreakdown, applying: trendCategoryAverages),
                 appLanguage: appLanguage
             )
 
@@ -5065,7 +6177,10 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "הוצאות החודש", en: "Monthly expenses"),
                 value: selectedMetrics.expenses.formattedShekelAmount,
-                subtitle: appLanguage.text(he: "\(selectedMetrics.expenseCount) פעולות", en: "\(selectedMetrics.expenseCount) entries"),
+                subtitle: appLanguage.text(
+                    he: "\(selectedMetrics.expenseCount) פעולות · ממוצע חודשי: \(recentSixMonthAverages.expenses.formattedShekelAmount)",
+                    en: "\(selectedMetrics.expenseCount) entries · Monthly average: \(recentSixMonthAverages.expenses.formattedShekelAmount)"
+                ),
                 systemImageName: "cart.fill",
                 tint: .red,
                 appLanguage: appLanguage
@@ -5099,13 +6214,13 @@ private struct AnalyticsView: View {
             )
 
             AnalyticsCategoryGraphView(
-                breakdown: selectedMetrics.categoryBreakdown,
+                breakdown: categoryBreakdown(selectedMetrics.categoryBreakdown, applying: recentSixMonthCategoryAverages),
                 chartKind: $categoryChartKind,
                 appLanguage: appLanguage
             )
 
             AnalyticsCategoryRankingView(
-                breakdown: selectedMetrics.categoryBreakdown,
+                breakdown: categoryBreakdown(selectedMetrics.categoryBreakdown, applying: recentSixMonthCategoryAverages),
                 appLanguage: appLanguage
             )
         }
@@ -5116,7 +6231,7 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "הכנסות החודש", en: "Monthly Income"),
                 value: selectedMetrics.income.formattedShekelAmount,
-                subtitle: nil,
+                subtitle: monthlyAverageText(for: recentSixMonthAverages.income),
                 systemImageName: "arrow.down.circle.fill",
                 tint: .green,
                 appLanguage: appLanguage
@@ -5131,7 +6246,7 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "סך החיסכון", en: "Total Savings"),
                 value: selectedMetrics.savingsBalance.formattedShekelAmount,
-                subtitle: monthlySavingsAverageText,
+                subtitle: monthlyAverageText(for: recentSixMonthAverages.netSavings),
                 systemImageName: "banknote.fill",
                 tint: .blue,
                 appLanguage: appLanguage
@@ -5160,7 +6275,7 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "חייבים לי", en: "Owed to me"),
                 value: selectedMetrics.owedToMe.formattedShekelAmount,
-                subtitle: nil,
+                subtitle: monthlyAverageText(for: recentSixMonthAverages.openDebt),
                 systemImageName: "person.crop.circle.badge.plus",
                 tint: .purple,
                 appLanguage: appLanguage
@@ -5169,7 +6284,10 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "אני חייב", en: "I owe"),
                 value: selectedMetrics.iOwe.formattedShekelAmount,
-                subtitle: nil,
+                subtitle: appLanguage.text(
+                    he: "ממוצע חובות פתוחים חודשי: \(recentSixMonthAverages.openDebt.formattedShekelAmount)",
+                    en: "Average monthly open debt: \(recentSixMonthAverages.openDebt.formattedShekelAmount)"
+                ),
                 systemImageName: "person.crop.circle.badge.exclamationmark",
                 tint: .pink,
                 appLanguage: appLanguage
@@ -5186,12 +6304,15 @@ private struct AnalyticsView: View {
         }
     }
 
-    private func analyticsCards(for metrics: AnalyticsMonthMetrics) -> some View {
+    private func analyticsCards(for metrics: AnalyticsMonthMetrics, averages: AnalyticsMonthlyAverages) -> some View {
         LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "סך הוצאות", en: "Total Expenses"),
                 value: metrics.expenses.formattedShekelAmount,
-                subtitle: nil,
+                subtitle: appLanguage.text(
+                    he: "ממוצע הוצאות חודשי: \(averages.expenses.formattedShekelAmount)",
+                    en: "Average monthly expenses: \(averages.expenses.formattedShekelAmount)"
+                ),
                 systemImageName: "cart.fill",
                 tint: .red,
                 appLanguage: appLanguage
@@ -5200,7 +6321,10 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "הכנסות החודש", en: "Monthly Income"),
                 value: metrics.income.formattedShekelAmount,
-                subtitle: nil,
+                subtitle: appLanguage.text(
+                    he: "ממוצע הכנסות חודשי: \(averages.income.formattedShekelAmount)",
+                    en: "Average monthly income: \(averages.income.formattedShekelAmount)"
+                ),
                 systemImageName: "arrow.down.circle.fill",
                 tint: .green,
                 appLanguage: appLanguage
@@ -5209,7 +6333,10 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "סך החיסכון", en: "Total Savings"),
                 value: metrics.savingsBalance.formattedShekelAmount,
-                subtitle: monthlySavingsAverageText,
+                subtitle: appLanguage.text(
+                    he: "ממוצע חיסכון חודשי: \(averages.netSavings.formattedShekelAmount)",
+                    en: "Average monthly savings: \(averages.netSavings.formattedShekelAmount)"
+                ),
                 systemImageName: "banknote.fill",
                 tint: .blue,
                 appLanguage: appLanguage
@@ -5218,7 +6345,10 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "תזרים חודשי", en: "Monthly Cash Flow"),
                 value: metrics.netBalance.formattedShekelAmount,
-                subtitle: nil,
+                subtitle: appLanguage.text(
+                    he: "ממוצע תזרים חודשי: \(averages.cashFlow.formattedShekelAmount)",
+                    en: "Average monthly cash flow: \(averages.cashFlow.formattedShekelAmount)"
+                ),
                 systemImageName: metrics.netBalance >= 0 ? "plus.circle.fill" : "minus.circle.fill",
                 tint: metrics.netBalance >= 0 ? .green : .orange,
                 appLanguage: appLanguage
@@ -5227,7 +6357,10 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "חייבים לי החודש", en: "Owed to Me This Month"),
                 value: metrics.owedToMe.formattedShekelAmount,
-                subtitle: nil,
+                subtitle: appLanguage.text(
+                    he: "ממוצע חובות פתוחים חודשי: \(averages.openDebt.formattedShekelAmount)",
+                    en: "Average monthly open debt: \(averages.openDebt.formattedShekelAmount)"
+                ),
                 systemImageName: "person.crop.circle.badge.plus",
                 tint: .purple,
                 appLanguage: appLanguage
@@ -5236,7 +6369,10 @@ private struct AnalyticsView: View {
             AnalyticsSummaryCard(
                 title: appLanguage.text(he: "אני חייב החודש", en: "I Owe This Month"),
                 value: metrics.iOwe.formattedShekelAmount,
-                subtitle: nil,
+                subtitle: appLanguage.text(
+                    he: "ממוצע חובות פתוחים חודשי: \(averages.openDebt.formattedShekelAmount)",
+                    en: "Average monthly open debt: \(averages.openDebt.formattedShekelAmount)"
+                ),
                 systemImageName: "person.crop.circle.badge.exclamationmark",
                 tint: .pink,
                 appLanguage: appLanguage
@@ -5244,22 +6380,88 @@ private struct AnalyticsView: View {
         }
     }
 
-    private var monthlySavingsAverageText: String? {
-        let savingsMonths = recentSixMonthMetrics.filter { $0.netSavings != 0 }
-        guard !savingsMonths.isEmpty else {
-            return nil
-        }
-
-        let total = savingsMonths.reduce(Decimal(0)) { $0 + $1.netSavings }
-        let average = total / Decimal(savingsMonths.count)
+    private func monthlyAverageText(for average: Decimal) -> String {
         return appLanguage.text(
             he: "ממוצע חודשי: \(average.formattedShekelAmount)",
             en: "Monthly average: \(average.formattedShekelAmount)"
         )
     }
 
+    private func categoryAverages(from metrics: [AnalyticsMonthMetrics]) -> [String: Decimal] {
+        guard !metrics.isEmpty else {
+            return [:]
+        }
+
+        var totals: [String: Decimal] = [:]
+        for metric in metrics {
+            for category in metric.categoryBreakdown {
+                totals[category.id, default: 0] += category.amount
+            }
+        }
+
+        let monthCount = Decimal(metrics.count)
+        return totals.mapValues { $0 / monthCount }
+    }
+
+    private func categoryBreakdown(
+        _ breakdown: [AnalyticsCategoryBreakdown],
+        applying averages: [String: Decimal]
+    ) -> [AnalyticsCategoryBreakdown] {
+        breakdown.map { item in
+            AnalyticsCategoryBreakdown(
+                id: item.id,
+                name: item.name,
+                amount: item.amount,
+                percentage: item.percentage,
+                color: item.color,
+                monthlyTarget: item.monthlyTarget,
+                monthlyAverage: averages[item.id]
+            )
+        }
+    }
+
     private func metrics(for month: Date) -> AnalyticsMonthMetrics {
         let monthStart = startOfMonth(month)
+        let snapshot = resolvedSnapshot(for: monthStart)
+        let categoryBreakdown = categoryBreakdown(from: snapshot.categoryTotals, categoryNames: snapshot.categoryNames)
+        let topCategory = categoryBreakdown.first
+        let expenseGoal = categories.reduce(Decimal(0)) { $0 + ($1.monthlyTarget ?? 0) }
+
+        return AnalyticsMonthMetrics(
+            month: monthStart,
+            income: snapshot.income,
+            expenses: snapshot.expenses,
+            netSavings: snapshot.netSavings,
+            netBalance: snapshot.netBalance,
+            owedToMe: snapshot.owedToMe,
+            iOwe: snapshot.iOwe,
+            repaidDebts: snapshot.repaidDebts,
+            expenseCount: snapshot.expenseCount,
+            savingsBalance: Saving.balance(for: savings),
+            savingsGoal: Storage.loadSavingsGoal(),
+            expenseGoal: expenseGoal > 0 ? expenseGoal : nil,
+            categoryBreakdown: categoryBreakdown,
+            topExpenseCategoryName: topCategory?.name,
+            topExpenseCategoryAmount: topCategory?.amount ?? 0
+        )
+    }
+
+    private func resolvedSnapshot(for monthStart: Date) -> MonthlyAnalyticsSnapshot {
+        let computedSnapshot = computedSnapshot(for: monthStart)
+        let storedSnapshot = Storage.loadMonthlyAnalyticsSnapshots()[computedSnapshot.id]
+        let isCurrentMonth = Calendar.current.isDate(monthStart, equalTo: Date(), toGranularity: .month)
+
+        if !isCurrentMonth,
+           let storedSnapshot,
+           storedSnapshot.sourceSignature == computedSnapshot.sourceSignature {
+            return storedSnapshot
+        }
+
+        Storage.saveMonthlyAnalyticsSnapshot(computedSnapshot)
+        return computedSnapshot
+    }
+
+    private func computedSnapshot(for monthStart: Date) -> MonthlyAnalyticsSnapshot {
         let monthExpenses = expenses.filter { Calendar.current.isDate($0.date, equalTo: monthStart, toGranularity: .month) }
         let monthSavings = savings.filter { Calendar.current.isDate($0.date, equalTo: monthStart, toGranularity: .month) }
         let monthDebts = debts.filter { Calendar.current.isDate($0.date, equalTo: monthStart, toGranularity: .month) }
@@ -5269,7 +6471,8 @@ private struct AnalyticsView: View {
             .reduce(Decimal(0)) { $0 + $1.amount }
 
         let expenseTotal = netExpenseTotal(for: monthExpenses)
-        let categoryBreakdown = categoryBreakdown(for: monthExpenses, total: expenseTotal)
+        let categoryTotals = categoryTotals(for: monthExpenses)
+        let categoryNames = categoryNames(for: monthExpenses)
         let netSavings = monthSavings.reduce(Decimal(0)) { total, saving in
             switch saving.kind {
             case .deposit:
@@ -5288,10 +6491,8 @@ private struct AnalyticsView: View {
             .reduce(Decimal(0)) { $0 + $1.remainingAmount }
         let repaidDebts = monthDebts.reduce(Decimal(0)) { $0 + $1.repaidAmount }
 
-        let topCategory = categoryBreakdown.first
-        let expenseGoal = categories.reduce(Decimal(0)) { $0 + ($1.monthlyTarget ?? 0) }
-
-        return AnalyticsMonthMetrics(
+        return MonthlyAnalyticsSnapshot(
+            id: monthKey(for: monthStart),
             month: monthStart,
             income: income,
             expenses: expenseTotal,
@@ -5301,12 +6502,15 @@ private struct AnalyticsView: View {
             iOwe: iOwe,
             repaidDebts: repaidDebts,
             expenseCount: monthExpenses.count,
-            savingsBalance: Saving.balance(for: savings),
-            savingsGoal: Storage.loadSavingsGoal(),
-            expenseGoal: expenseGoal > 0 ? expenseGoal : nil,
-            categoryBreakdown: categoryBreakdown,
-            topExpenseCategoryName: topCategory?.name,
-            topExpenseCategoryAmount: topCategory?.amount ?? 0
+            categoryTotals: categoryTotals,
+            categoryNames: categoryNames,
+            sourceSignature: sourceSignature(
+                monthExpenses: monthExpenses,
+                monthSavings: monthSavings,
+                monthDebts: monthDebts,
+                monthSalaryEntries: salaryEntries.filter { Calendar.current.isDate($0.monthDate, equalTo: monthStart, toGranularity: .month) }
+            ),
+            updatedAt: Date()
         )
     }
 
@@ -5324,31 +6528,50 @@ private struct AnalyticsView: View {
     }
 
     private func categoryBreakdown(for expenses: [Expense], total: Decimal) -> [AnalyticsCategoryBreakdown] {
-        guard total > 0 else {
-            return []
-        }
+        categoryBreakdown(from: categoryTotals(for: expenses))
+    }
 
-        let colors: [Color] = [.blue, .green, .orange, .purple, .pink, .teal, .indigo, .brown, .cyan]
+    private func categoryTotals(for expenses: [Expense]) -> [String: Decimal] {
         let groupedExpenses = Dictionary(grouping: expenses) { expense in
             expense.categoryId
         }
-        var rows: [(id: String, name: String, amount: Decimal)] = []
 
-        for (categoryId, categoryExpenses) in groupedExpenses {
-            let rawAmount = categoryExpenses.reduce(Decimal(0)) { partialTotal, expense in
+        return groupedExpenses.reduce(into: [String: Decimal]()) { totals, groupedExpense in
+            let rawAmount = groupedExpense.value.reduce(Decimal(0)) { partialTotal, expense in
                 partialTotal + expense.netAmount
             }
             let amount = rawAmount < 0 ? Decimal(0) : rawAmount
 
             guard amount > 0 else {
-                continue
+                return
             }
 
-            rows.append((
-                id: categoryId,
-                name: categoryName(for: categoryId, fallbackExpenses: categoryExpenses),
-                amount: amount
-            ))
+            totals[groupedExpense.key] = amount
+        }
+    }
+
+    private func categoryNames(for expenses: [Expense]) -> [String: String] {
+        Dictionary(grouping: expenses, by: \.categoryId).reduce(into: [String: String]()) { names, groupedExpense in
+            guard let categoryName = groupedExpense.value.first?.displayCategoryName(for: appLanguage),
+                  !categoryName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return
+            }
+
+            names[groupedExpense.key] = categoryName
+        }
+    }
+
+    private func categoryBreakdown(from categoryTotals: [String: Decimal], categoryNames: [String: String] = [:]) -> [AnalyticsCategoryBreakdown] {
+        let total = categoryTotals.values.reduce(Decimal(0), +)
+        guard total > 0 else {
+            return []
+        }
+
+        let colors: [Color] = [.blue, .green, .orange, .purple, .pink, .teal, .indigo, .brown, .cyan]
+        var rows: [(id: String, name: String, amount: Decimal)] = []
+
+        for (categoryId, amount) in categoryTotals where amount > 0 {
+            rows.append((id: categoryId, name: categoryName(for: categoryId, fallbackName: categoryNames[categoryId]), amount: amount))
         }
 
         rows.sort { first, second in
@@ -5365,7 +6588,8 @@ private struct AnalyticsView: View {
                     amount: row.amount,
                     percentage: row.amount / total * 100,
                     color: colors[index % colors.count],
-                    monthlyTarget: monthlyTarget
+                    monthlyTarget: monthlyTarget,
+                    monthlyAverage: nil
                 )
             )
         }
@@ -5374,13 +6598,17 @@ private struct AnalyticsView: View {
     }
 
     private func categoryName(for categoryId: String, fallbackExpenses: [Expense]) -> String {
+        categoryName(for: categoryId, fallbackName: fallbackExpenses.first?.displayCategoryName(for: appLanguage))
+    }
+
+    private func categoryName(for categoryId: String, fallbackName: String? = nil) -> String {
         if let category = categories.first(where: { $0.id == categoryId }) {
             return category.displayName(for: appLanguage)
         }
 
-        if let expenseName = fallbackExpenses.first?.displayCategoryName(for: appLanguage),
-           !expenseName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return expenseName
+        if let fallbackName,
+           !fallbackName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return fallbackName
         }
 
         return appLanguage.text(he: "ללא קטגוריה", en: "Uncategorized")
@@ -5389,6 +6617,66 @@ private struct AnalyticsView: View {
     private func startOfMonth(_ date: Date) -> Date {
         let components = Calendar.current.dateComponents([.year, .month], from: date)
         return Calendar.current.date(from: components) ?? date
+    }
+
+    private func monthKey(for date: Date) -> String {
+        let components = Calendar.current.dateComponents([.year, .month], from: date)
+        let year = components.year ?? 0
+        let month = components.month ?? 0
+        return String(format: "%04d-%02d", year, month)
+    }
+
+    private func sourceSignature(
+        monthExpenses: [Expense],
+        monthSavings: [Saving],
+        monthDebts: [Debt],
+        monthSalaryEntries: [SalaryEntry]
+    ) -> String {
+        let expenseSignature = monthExpenses
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+            .map {
+                [
+                    $0.id.uuidString,
+                    $0.categoryId,
+                    $0.categoryName,
+                    $0.amount.plainString,
+                    $0.refundedAmount.plainString,
+                    String(Int($0.date.timeIntervalSince1970))
+                ].joined(separator: ":")
+            }
+            .joined(separator: ",")
+
+        let savingSignature = monthSavings
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+            .map {
+                [
+                    $0.id.uuidString,
+                    $0.amount.plainString,
+                    $0.kind.rawValue,
+                    String(Int($0.date.timeIntervalSince1970))
+                ].joined(separator: ":")
+            }
+            .joined(separator: ",")
+
+        let debtSignature = monthDebts
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+            .map {
+                [
+                    $0.id.uuidString,
+                    $0.direction.rawValue,
+                    $0.originalAmount.plainString,
+                    $0.repaidAmount.plainString,
+                    String(Int($0.date.timeIntervalSince1970))
+                ].joined(separator: ":")
+            }
+            .joined(separator: ",")
+
+        let salarySignature = monthSalaryEntries
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+            .map { "\($0.id.uuidString):\($0.amount.plainString):\($0.year):\($0.month)" }
+            .joined(separator: ",")
+
+        return [expenseSignature, savingSignature, debtSignature, salarySignature].joined(separator: "|")
     }
 }
 
@@ -5470,7 +6758,6 @@ private struct AnalyticsGoalProgressView: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-                    .multilineTextAlignment(appLanguage == .he ? .trailing : .leading)
 
                 if let warningText {
                     Text(warningText)
@@ -5676,7 +6963,7 @@ private struct AnalyticsCategoryBarChartView: View {
                     }
 
                     GeometryReader { proxy in
-                        ZStack(alignment: appLanguage == .he ? .trailing : .leading) {
+                        ZStack(alignment: appLanguage.frameAlignment) {
                             let totalWidth = item.hasMonthlyTarget
                                 ? targetProgressTotalWidth(for: item, maxWidth: proxy.size.width)
                                 : barWidth(for: item.amount, maxWidth: proxy.size.width)
@@ -5704,7 +6991,7 @@ private struct AnalyticsCategoryBarChartView: View {
                                             .frame(width: overrunWidth)
                                     }
                                 }
-                                .frame(width: totalWidth, alignment: appLanguage == .he ? .trailing : .leading)
+                                .frame(width: totalWidth, alignment: appLanguage.frameAlignment)
                                 .clipShape(Capsule())
                             } else {
                                 RoundedRectangle(cornerRadius: 5, style: .continuous)
@@ -5837,6 +7124,18 @@ private struct AnalyticsCategoryRankingRow: View {
                 }
             }
 
+            if let monthlyAverage = item.monthlyAverage {
+                Text(appLanguage.text(
+                    he: "ממוצע חודשי: \(monthlyAverage.formattedShekelAmount)",
+                    en: "Monthly average: \(monthlyAverage.formattedShekelAmount)"
+                ))
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            }
+
             if let targetStatus = item.targetStatus {
                 VStack(alignment: appLanguage.horizontalAlignment, spacing: 2) {
                     Text(categoryTargetRatioText(targetStatus, language: appLanguage))
@@ -5852,7 +7151,7 @@ private struct AnalyticsCategoryRankingRow: View {
             }
 
             GeometryReader { proxy in
-                ZStack(alignment: appLanguage == .he ? .trailing : .leading) {
+                ZStack(alignment: appLanguage.frameAlignment) {
                     let totalWidth = item.hasMonthlyTarget
                         ? targetProgressTotalWidth(maxWidth: proxy.size.width)
                         : max(8, proxy.size.width * percentageWidth)
@@ -5880,7 +7179,7 @@ private struct AnalyticsCategoryRankingRow: View {
                                     .frame(width: overrunWidth)
                             }
                         }
-                        .frame(width: totalWidth, alignment: appLanguage == .he ? .trailing : .leading)
+                        .frame(width: totalWidth, alignment: appLanguage.frameAlignment)
                         .clipShape(Capsule())
                     } else {
                         RoundedRectangle(cornerRadius: 4, style: .continuous)
@@ -6016,7 +7315,6 @@ private struct AnalyticsEmptyStateView: View {
             .font(.subheadline.weight(.medium))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-            .multilineTextAlignment(appLanguage == .he ? .trailing : .leading)
             .padding(.vertical, 18)
     }
 }
@@ -6150,7 +7448,6 @@ private struct AnalyticsSectionPlaceholder: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-                .multilineTextAlignment(appLanguage == .he ? .trailing : .leading)
         }
         .padding(16)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -6336,7 +7633,6 @@ private struct PastDataView: View {
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-                            .multilineTextAlignment(appLanguage.textAlignment)
                             .padding(.horizontal, 4)
 
                         if selectedMonthHasNoData {
@@ -6835,7 +8131,13 @@ private struct PastDataView: View {
         isAddingExpense = false
     }
 
-    private func addExpenseFromModal(name: String, amount: Decimal, isRecurring: Bool, date: Date, categoryId: String?) -> String? {
+    private func addExpenseFromModal(
+        name: String,
+        amount: Decimal,
+        isRecurring: Bool,
+        date: Date,
+        categoryId: String?
+    ) -> String? {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard amount > 0 else {
@@ -6978,7 +8280,6 @@ private struct PastDataSectionHeader: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-                .multilineTextAlignment(appLanguage.textAlignment)
 
             Divider()
                 .padding(.top, 4)
@@ -6997,7 +8298,6 @@ private struct PastDataEmptyState: View {
             .font(.subheadline.weight(.medium))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-            .multilineTextAlignment(appLanguage.textAlignment)
             .padding(.vertical, 10)
     }
 }
@@ -7031,7 +8331,6 @@ private struct ExpensePastDataRow: View {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Text(displayName)
                     .font(.subheadline.weight(.semibold))
-                    .multilineTextAlignment(appLanguage.textAlignment)
 
                 Spacer(minLength: 8)
 
@@ -7302,6 +8601,7 @@ private struct EditMonthlyTargetView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -7405,7 +8705,6 @@ private struct MonthlyTargetSummaryView: View {
                     ))
                 )
                 .font(.headline)
-                .multilineTextAlignment(appLanguage.textAlignment)
                 .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
 
                 if remainingAmount >= 0 {
@@ -7455,7 +8754,13 @@ private struct MonthNavigationView: View {
     @Environment(\.appLanguage) private var appLanguage
 
     @Binding var selectedMonth: Date
+    let maximumMonth: Date?
     @State private var isMonthPickerPresented = false
+
+    init(selectedMonth: Binding<Date>, maximumMonth: Date? = nil) {
+        _selectedMonth = selectedMonth
+        self.maximumMonth = maximumMonth
+    }
 
     var body: some View {
         HStack {
@@ -7465,6 +8770,8 @@ private struct MonthNavigationView: View {
                 Image(systemName: "chevron.left")
             }
             .buttonStyle(.borderless)
+            .disabled(isOffsetBlocked(leftMonthOffset))
+            .accessibilityLabel(accessibilityLabel(for: leftMonthOffset))
 
             Spacer()
 
@@ -7486,6 +8793,9 @@ private struct MonthNavigationView: View {
                     .datePickerStyle(.graphical)
                     .padding()
                     .frame(minWidth: 320)
+                    .onChange(of: selectedMonth) {
+                        clampSelectedMonthToMaximum()
+                    }
                     .environment(\.layoutDirection, appLanguage.layoutDirection)
                     .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
                     .presentationCompactAdaptation(.popover)
@@ -7499,6 +8809,8 @@ private struct MonthNavigationView: View {
                 Image(systemName: "chevron.right")
             }
             .buttonStyle(.borderless)
+            .disabled(isOffsetBlocked(rightMonthOffset))
+            .accessibilityLabel(accessibilityLabel(for: rightMonthOffset))
         }
         .environment(\.layoutDirection, .leftToRight)
     }
@@ -7512,7 +8824,38 @@ private struct MonthNavigationView: View {
     }
 
     private func moveMonth(by value: Int) {
+        guard !isOffsetBlocked(value) else {
+            return
+        }
+
         selectedMonth = Calendar.current.date(byAdding: .month, value: value, to: selectedMonth) ?? selectedMonth
+        clampSelectedMonthToMaximum()
+    }
+
+    private func isOffsetBlocked(_ value: Int) -> Bool {
+        guard let maximumMonth,
+              let candidateMonth = Calendar.current.date(byAdding: .month, value: value, to: selectedMonth) else {
+            return false
+        }
+
+        return Calendar.current.normalizedMonthDate(for: candidateMonth) > Calendar.current.normalizedMonthDate(for: maximumMonth)
+    }
+
+    private func clampSelectedMonthToMaximum() {
+        guard let maximumMonth else {
+            return
+        }
+
+        let maxMonth = Calendar.current.normalizedMonthDate(for: maximumMonth)
+        if Calendar.current.normalizedMonthDate(for: selectedMonth) > maxMonth {
+            selectedMonth = maxMonth
+        }
+    }
+
+    private func accessibilityLabel(for offset: Int) -> String {
+        offset > 0
+            ? appLanguage.text(he: "חודש הבא", en: "Next Month")
+            : appLanguage.text(he: "חודש קודם", en: "Previous Month")
     }
 }
 
@@ -7684,8 +9027,12 @@ private struct EditExpenseView: View {
         Decimal(string: refundedAmountText, locale: Locale(identifier: "en_US_POSIX"))
     }
 
+    private var convertedAmount: Decimal {
+        parsedAmount ?? 0
+    }
+
     private var effectiveRefundedAmount: Decimal {
-        guard let parsedAmount else {
+        guard convertedAmount > 0 else {
             return 0
         }
 
@@ -7695,16 +9042,16 @@ private struct EditExpenseView: View {
         case .partial:
             return parsedRefundedAmount ?? 0
         case .full:
-            return parsedAmount
+            return convertedAmount
         }
     }
 
     private var netAmount: Decimal {
-        guard let parsedAmount else {
+        guard convertedAmount > 0 else {
             return 0
         }
 
-        return max(parsedAmount - effectiveRefundedAmount, 0)
+        return max(convertedAmount - effectiveRefundedAmount, 0)
     }
 
     private var canSave: Bool {
@@ -7716,7 +9063,7 @@ private struct EditExpenseView: View {
         case .none, .full:
             return true
         case .partial:
-            return effectiveRefundedAmount > 0 && effectiveRefundedAmount < parsedAmount
+            return effectiveRefundedAmount > 0 && effectiveRefundedAmount < convertedAmount
         }
     }
 
@@ -7743,7 +9090,7 @@ private struct EditExpenseView: View {
             TextField(appLanguage.text(he: "הערה", en: "Note"), text: $name)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.headline)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -7777,9 +9124,9 @@ private struct EditExpenseView: View {
                 }
 
                 Button(appLanguage.text(he: "החזר מלא", en: "Full Refund")) {
-                    if let parsedAmount {
+                    if convertedAmount > 0 {
                         refundMode = .full
-                        refundedAmountText = parsedAmount.plainString
+                        refundedAmountText = convertedAmount.plainString
                         errorMessage = nil
                     }
                 }
@@ -7811,6 +9158,7 @@ private struct EditExpenseView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -7826,7 +9174,21 @@ private struct EditExpenseView: View {
                         return
                     }
 
-                    let refundedAmount = effectiveRefundedAmount
+                    guard let category = selectedCategory else {
+                        errorMessage = appLanguage.text(he: "צריך לבחור קטגוריה", en: "Choose a category")
+                        return
+                    }
+
+                    let refundedAmount: Decimal
+                    switch refundMode {
+                    case .none:
+                        refundedAmount = 0
+                    case .partial:
+                        refundedAmount = parsedRefundedAmount ?? 0
+                    case .full:
+                        refundedAmount = amount
+                    }
+
                     if refundMode == .partial {
                         guard refundedAmount > 0 else {
                             errorMessage = appLanguage.text(
@@ -7850,11 +9212,6 @@ private struct EditExpenseView: View {
                             he: "סכום ההחזר לא יכול להיות גדול מסכום ההוצאה",
                             en: "Refund amount cannot exceed the expense amount"
                         )
-                        return
-                    }
-
-                    guard let category = selectedCategory else {
-                        errorMessage = appLanguage.text(he: "צריך לבחור קטגוריה", en: "Choose a category")
                         return
                     }
 
@@ -7947,7 +9304,7 @@ private struct HistoricalExpenseEditorView: View {
             TextField(appLanguage.text(he: "שם ההוצאה", en: "Expense name"), text: $name)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.headline)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -7971,6 +9328,7 @@ private struct HistoricalExpenseEditorView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -7991,12 +9349,13 @@ private struct HistoricalExpenseEditorView: View {
                         return
                     }
 
+                    let expenseDate = allowsDateTimeSelection ? date : Calendar.current.normalizedMonthDate(for: selectedMonth)
                     onSave(Expense(
                         categoryId: category.id,
                         categoryName: category.name,
                         amount: amount,
                         createdAt: Date(),
-                        date: allowsDateTimeSelection ? date : Calendar.current.normalizedMonthDate(for: selectedMonth),
+                        date: expenseDate,
                         name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                         source: .backfill
                     ))
@@ -8082,6 +9441,7 @@ private struct SalaryEntryEditorView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -8237,6 +9597,16 @@ private struct SavingEditorView: View {
             }
             .pickerStyle(.segmented)
 
+            if kind == .withdrawal && hasWithdrawalSources {
+                Text(appLanguage.text(
+                    he: "זמין למשיכה: \(selectedAvailableBalance.formattedShekelAmount)",
+                    en: "Available to withdraw: \(selectedAvailableBalance.formattedShekelAmount)"
+                ))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
+            }
+
             AmountInputField(amountText: $amountText)
                 .onChange(of: amountText) {
                     errorMessage = nil
@@ -8273,7 +9643,7 @@ private struct SavingEditorView: View {
                 TextField(appLanguage.text(he: "איפה החסכון?", en: "Where is the saving held?"), text: $customLocation)
                     .keyboardType(.default)
                     .textInputAutocapitalization(.never)
-                    .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                     .font(.headline)
                     .padding(.vertical, 9)
                     .padding(.horizontal, 14)
@@ -8300,20 +9670,10 @@ private struct SavingEditorView: View {
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
             }
 
-            if kind == .withdrawal && hasWithdrawalSources {
-                Text(appLanguage.text(
-                    he: "זמין למשיכה: \(selectedAvailableBalance.formattedShekelAmount)",
-                    en: "Available to withdraw: \(selectedAvailableBalance.formattedShekelAmount)"
-                ))
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
-            }
-
             TextField(appLanguage.text(he: "שם / הערה", en: "Name / note"), text: $note)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.headline)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -8322,6 +9682,7 @@ private struct SavingEditorView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -8347,8 +9708,8 @@ private struct SavingEditorView: View {
 
                     guard kind == .deposit || amount <= selectedAvailableBalance else {
                         errorMessage = appLanguage.text(
-                            he: "לא ניתן למשוך יותר מהיתרה הזמינה",
-                            en: "You cannot withdraw more than the available balance"
+                            he: "לא ניתן למשוך יותר מהסכום הזמין",
+                            en: "Cannot withdraw more than the available amount"
                         )
                         return
                     }
@@ -8446,7 +9807,7 @@ private struct EditRecurringExpenseView: View {
             TextField(appLanguage.text(he: "שם הוצאה", en: "Expense name"), text: $name)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.headline)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -8463,6 +9824,7 @@ private struct EditRecurringExpenseView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -8546,7 +9908,7 @@ private struct EditCategoryView: View {
             TextField(appLanguage.text(he: "שם קטגוריה", en: "Category name"), text: $categoryName)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
-                .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                 .font(.title3)
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
@@ -8568,6 +9930,7 @@ private struct EditCategoryView: View {
             Text(errorMessage ?? " ")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
+                .localizedFieldMessage(appLanguage)
                 .frame(height: 18)
 
             HStack(spacing: 12) {
@@ -8684,49 +10047,28 @@ private struct CategoryAppearancePicker: View {
 
     @Binding var selectedSystemImageName: String
     @Binding var selectedTintName: String
+    @State private var isIconPickerPresented = false
 
     var body: some View {
-        VStack(spacing: 12) {
-            LazyVGrid(columns: Array(repeating: GridItem(.fixed(42), spacing: 10), count: 4), spacing: 10) {
-                ForEach(CategoryAppearanceOption.systemImages, id: \.self) { systemImageName in
-                    Button {
-                        selectedSystemImageName = systemImageName
-                    } label: {
-                        CategoryAppearanceOptionButton(
-                            value: systemImageName,
-                            selectedValue: selectedSystemImageName,
-                            tintName: selectedTintName
-                        )
-                    }
-                    .buttonStyle(.plain)
+        VStack(spacing: 14) {
+            Button {
+                selectedSystemImageName = selectedSystemImageName.safeCategorySystemImageName
+                isIconPickerPresented = true
+            } label: {
+                CategoryIconView(
+                    systemImageName: selectedSystemImageName.safeCategorySystemImageName,
+                    tint: selectedTintName.categoryTint,
+                    size: 34
+                )
+                .frame(width: 66, height: 66)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(selectedTintName.categoryTint.opacity(0.55), lineWidth: 2)
                 }
-
             }
-
-            ZStack {
-                Circle()
-                    .fill(.thinMaterial)
-                    .frame(width: 56, height: 56)
-                    .overlay {
-                        Circle()
-                            .stroke(selectedSystemImageName.categoryEmoji == nil ? .clear : selectedTintName.categoryTint, lineWidth: 3)
-                    }
-
-                if selectedSystemImageName.categoryEmoji == nil {
-                    Image(systemName: "face.smiling")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(selectedTintName.categoryTint)
-                }
-
-                TextField("", text: emojiBinding)
-                    .keyboardType(.default)
-                    .textInputAutocapitalization(.never)
-                    .multilineTextAlignment(.center)
-                    .font(.title2)
-                    .frame(width: 56, height: 56)
-                    .opacity(selectedSystemImageName.categoryEmoji == nil ? 0.02 : 1)
-                    .accessibilityLabel(appLanguage.text(he: "בחר אימוג׳י", en: "Choose Emoji"))
-            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(appLanguage.text(he: "בחר אייקון", en: "Choose Icon"))
 
             HStack(spacing: 10) {
                 ForEach(CategoryAppearanceOption.tintNames, id: \.self) { tintName in
@@ -8745,21 +10087,130 @@ private struct CategoryAppearancePicker: View {
                 }
             }
         }
+        .onAppear {
+            selectedSystemImageName = selectedSystemImageName.safeCategorySystemImageName
+        }
+        .sheet(isPresented: $isIconPickerPresented) {
+            CategorySymbolPickerSheet(
+                selectedSystemImageName: $selectedSystemImageName,
+                tintName: selectedTintName,
+                onClose: {
+                    isIconPickerPresented = false
+                }
+            )
+            .localizedPresentationEnvironment(appLanguage)
+            .presentationDetents([.height(520)])
+        }
+    }
+}
+
+private struct CategorySymbolPickerSheet: View {
+    @Environment(\.appLanguage) private var appLanguage
+
+    @Binding var selectedSystemImageName: String
+    let tintName: String
+    let onClose: () -> Void
+
+    @State private var searchText = ""
+
+    private var trimmedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private var emojiBinding: Binding<String> {
-        Binding(
-            get: {
-                selectedSystemImageName.categoryEmoji ?? ""
-            },
-            set: { newValue in
-                guard let firstCharacter = newValue.trimmingCharacters(in: .whitespacesAndNewlines).first else {
-                    return
-                }
+    private var visibleGroups: [CategoryAppearanceSymbolGroup] {
+        let query = trimmedSearchText.lowercased()
 
-                selectedSystemImageName = "emoji:\(String(firstCharacter))"
+        guard !query.isEmpty else {
+            return CategoryAppearanceOption.symbolGroups
+        }
+
+        return CategoryAppearanceOption.symbolGroups.compactMap { group in
+            let groupMatches = group.titleHE.lowercased().contains(query)
+                || group.titleEN.lowercased().contains(query)
+                || group.searchKeywords.contains { keyword in
+                    keyword.lowercased().contains(query)
+                }
+            let filteredSymbols = group.symbols.filter { symbol in
+                groupMatches || symbol.lowercased().contains(query)
             }
-        )
+
+            guard !filteredSymbols.isEmpty else {
+                return nil
+            }
+
+            return CategoryAppearanceSymbolGroup(
+                titleHE: group.titleHE,
+                titleEN: group.titleEN,
+                searchKeywords: group.searchKeywords,
+                symbols: filteredSymbols
+            )
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 12) {
+                TextField(appLanguage.text(he: "חיפוש אייקון", en: "Search Icon"), text: $searchText)
+                    .keyboardType(.default)
+                    .textInputAutocapitalization(.never)
+                .localizedTextInput(appLanguage)
+                    .font(.headline)
+                    .padding(.vertical, 10)
+                    .padding(.horizontal, 12)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.horizontal, 16)
+
+                ScrollView {
+                    LazyVStack(alignment: appLanguage.horizontalAlignment, spacing: 18) {
+                        if visibleGroups.isEmpty {
+                            Text(appLanguage.text(he: "לא נמצאו אייקונים", en: "No icons found"))
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.top, 40)
+                        }
+
+                        ForEach(visibleGroups) { group in
+                            VStack(alignment: appLanguage.horizontalAlignment, spacing: 8) {
+                                Text(group.title(for: appLanguage))
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
+                                    .padding(.horizontal, 16)
+
+                                LazyVGrid(columns: Array(repeating: GridItem(.fixed(44), spacing: 10), count: 6), spacing: 10) {
+                                    ForEach(group.symbols, id: \.self) { systemImageName in
+                                        Button {
+                                            selectedSystemImageName = systemImageName
+                                            onClose()
+                                        } label: {
+                                            CategoryAppearanceOptionButton(
+                                                value: systemImageName,
+                                                selectedValue: selectedSystemImageName.safeCategorySystemImageName,
+                                                tintName: tintName
+                                            )
+                                        }
+                                        .buttonStyle(.plain)
+                                        .accessibilityLabel(systemImageName)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .center)
+                            }
+                        }
+                    }
+                    .padding(.bottom, 18)
+                }
+            }
+            .navigationTitle(appLanguage.text(he: "בחר אייקון", en: "Choose Icon"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(appLanguage.text(he: "סגור", en: "Close")) {
+                        onClose()
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -8793,7 +10244,7 @@ private struct CategoryIconView: View {
             Text(emoji)
                 .font(.system(size: size + 5))
         } else {
-            Image(systemName: systemImageName)
+            Image(systemName: systemImageName.safeCategorySystemImageName)
                 .font(.system(size: size, weight: .semibold))
                 .foregroundStyle(tint)
         }
@@ -8847,7 +10298,7 @@ private struct BackfillExpenseView: View {
                     TextField(appLanguage.text(he: "שם ההוצאה", en: "Expense name"), text: $expenseName)
                         .keyboardType(.default)
                         .textInputAutocapitalization(.never)
-                        .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                         .onChange(of: expenseName) {
                             errorMessage = nil
                         }
@@ -8883,7 +10334,7 @@ private struct BackfillExpenseView: View {
                 TextField(appLanguage.text(he: "שם קטגוריה חדשה", en: "New category name"), text: $newCategoryName)
                     .keyboardType(.default)
                     .textInputAutocapitalization(.never)
-                    .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                     .onChange(of: newCategoryName) {
                         errorMessage = nil
                     }
@@ -8905,6 +10356,7 @@ private struct BackfillExpenseView: View {
                         Text(errorMessage)
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(.red)
+                            .localizedFieldMessage(appLanguage)
                     }
                 }
             }
@@ -9029,7 +10481,7 @@ private struct AddExpenseModalView: View {
                 TextField(appLanguage.text(he: "שם ההוצאה", en: "Expense name"), text: $name)
                     .keyboardType(.default)
                     .textInputAutocapitalization(.never)
-                    .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                     .font(.headline)
                     .padding(.vertical, 7)
                     .padding(.horizontal, 12)
@@ -9069,6 +10521,7 @@ private struct AddExpenseModalView: View {
                 Text(errorMessage ?? " ")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(.red)
+                    .localizedFieldMessage(appLanguage)
                     .frame(height: 18)
 
                 Button {
@@ -9164,7 +10617,7 @@ private struct RecurringExpenseModalView: View {
                 TextField(appLanguage.text(he: "שם ההוצאה", en: "Expense name"), text: $name)
                     .keyboardType(.default)
                     .textInputAutocapitalization(.never)
-                    .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                     .font(.headline)
                     .padding(.vertical, 9)
                     .padding(.horizontal, 14)
@@ -9198,7 +10651,7 @@ private struct RecurringExpenseModalView: View {
                     TextField(appLanguage.text(he: "שם קטגוריה חדשה", en: "New category name"), text: $newCategoryName)
                         .keyboardType(.default)
                         .textInputAutocapitalization(.never)
-                        .multilineTextAlignment(appLanguage.textAlignment)
+                .localizedTextInput(appLanguage)
                         .font(.headline)
                         .padding(.vertical, 9)
                         .padding(.horizontal, 14)
@@ -9216,6 +10669,7 @@ private struct RecurringExpenseModalView: View {
                 Text(errorMessage ?? " ")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(.red)
+                    .localizedFieldMessage(appLanguage)
                     .frame(height: 18)
 
                 Button {
@@ -9431,7 +10885,7 @@ private struct ManageCategoriesView: View {
                 onCancel: closeAddCategory
             )
             .localizedPresentationEnvironment(appLanguage)
-            .presentationDetents([.height(430)])
+            .presentationDetents([.height(620)])
         }
         .sheet(item: $categoryBeingRenamed) { category in
             EditCategoryView(
@@ -9520,6 +10974,7 @@ private struct ManageCategoriesView: View {
             TextField(appLanguage.text(he: "שם קטגוריה", en: "Category name"), text: $reassignNewCategoryName)
                 .keyboardType(.default)
                 .textInputAutocapitalization(.never)
+                .localizedTextInput(appLanguage)
 
             Button(appLanguage.text(he: "ביטול", en: "Cancel"), role: .cancel) {
                 clearReassignState()
@@ -9914,26 +11369,26 @@ private struct CategoryCard: View {
     let onAddTarget: () -> Void
 
     var body: some View {
-        VStack(spacing: 9) {
+        VStack(spacing: 12) {
             VStack(spacing: 4) {
                 if let monthlyTargetStatus {
-                    Text(categoryTargetRatioText(monthlyTargetStatus, language: appLanguage))
+                    Text(categoryTargetMainProgressText(monthlyTargetStatus, language: appLanguage))
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
 
-                    Text(categoryTargetStatusLineText(monthlyTargetStatus, language: appLanguage))
-                        .font(.subheadline.weight(.bold))
-                        .foregroundStyle(monthlyTargetStatus.isOverBudget ? Color.red : (monthlyTargetStatus.remainingAmount > 0 ? Color.green : .secondary))
+                    Text(categoryTargetMainRemainingText(monthlyTargetStatus, language: appLanguage))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(monthlyTargetStatus.isOverBudget ? Color.red : .secondary)
                         .multilineTextAlignment(.center)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
                 } else {
                     HStack(spacing: 5) {
                         Text(appLanguage.text(he: "ללא יעד", en: "No target"))
-                            .foregroundStyle(.primary)
+                            .foregroundStyle(.secondary)
 
                         Text("·")
                             .foregroundStyle(.secondary)
@@ -9942,8 +11397,11 @@ private struct CategoryCard: View {
                             onAddTarget()
                         } label: {
                             Text(appLanguage.text(he: "הוסף יעד", en: "Add target"))
-                                .foregroundStyle(.blue)
-                                .underline()
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Color.secondary.opacity(0.12), in: Capsule())
+                                .foregroundStyle(.primary)
                         }
                         .buttonStyle(.plain)
                     }
@@ -9958,9 +11416,9 @@ private struct CategoryCard: View {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(category.tint.opacity(isSelected ? 0.24 : 0.14))
 
-                CategoryIconView(systemImageName: category.systemImageName, tint: category.tint, size: 72)
+                CategoryIconView(systemImageName: category.systemImageName, tint: category.tint, size: 84)
             }
-            .frame(width: 178, height: 178)
+            .frame(width: 188, height: 188)
             .overlay {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(isSelected ? category.tint : .clear, lineWidth: 3)
@@ -10019,6 +11477,11 @@ private struct CategoryPageDots: View {
 }
 
 private extension Decimal {
+    func mainTargetAmountText(for language: AppLanguage) -> String {
+        let symbol = Storage.loadCurrency().symbol
+        return language == .he ? "\(plainString)\(symbol)" : "\(symbol)\(plainString)"
+    }
+
     var formattedShekelAmount: String {
         let formatter = NumberFormatter()
         formatter.numberStyle = .currency
@@ -10058,6 +11521,13 @@ private extension Decimal {
         let value = formatter.string(from: self as NSDecimalNumber) ?? "\(self)"
         return "\(value)%"
     }
+
+    var roundedCurrencyAmount: Decimal {
+        var value = self
+        var rounded = Decimal()
+        NSDecimalRound(&rounded, &value, 2, .plain)
+        return rounded
+    }
 }
 
 private extension String {
@@ -10071,6 +11541,18 @@ private extension String {
         }
 
         return String(dropFirst("emoji:".count))
+    }
+
+    var safeCategorySystemImageName: String {
+        let trimmedValue = trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedValue.isEmpty,
+              categoryEmoji == nil,
+              CategoryAppearanceOption.systemImages.contains(trimmedValue) else {
+            return CategoryAppearanceOption.fallbackSystemImageName
+        }
+
+        return trimmedValue
     }
 
     var categoryTint: Color {
@@ -10093,6 +11575,117 @@ private extension String {
             .yellow
         default:
             .gray
+        }
+    }
+}
+
+private extension Int {
+    func salaryReceiptDayTitle(for language: AppLanguage, dateDisplayFormat: DateDisplayFormat) -> String {
+        let day = Swift.min(Swift.max(self, 1), 31)
+
+        if dateDisplayFormat == .hebrewCalendar {
+            return "\(day.hebrewNumeralDayText) לחודש"
+        }
+
+        switch language {
+        case .he:
+            return "\(day.hebrewOrdinalDayText) לחודש"
+        case .en:
+            return "\(day)\(day.englishOrdinalSuffix) of the month"
+        }
+    }
+
+    private var englishOrdinalSuffix: String {
+        let day = Swift.min(Swift.max(self, 1), 31)
+        let lastTwoDigits = day % 100
+
+        if (11...13).contains(lastTwoDigits) {
+            return "th"
+        }
+
+        switch day % 10 {
+        case 1:
+            return "st"
+        case 2:
+            return "nd"
+        case 3:
+            return "rd"
+        default:
+            return "th"
+        }
+    }
+
+    private var hebrewNumeralDayText: String {
+        switch Swift.min(Swift.max(self, 1), 31) {
+        case 1: "א׳"
+        case 2: "ב׳"
+        case 3: "ג׳"
+        case 4: "ד׳"
+        case 5: "ה׳"
+        case 6: "ו׳"
+        case 7: "ז׳"
+        case 8: "ח׳"
+        case 9: "ט׳"
+        case 10: "י׳"
+        case 11: "י״א"
+        case 12: "י״ב"
+        case 13: "י״ג"
+        case 14: "י״ד"
+        case 15: "ט״ו"
+        case 16: "ט״ז"
+        case 17: "י״ז"
+        case 18: "י״ח"
+        case 19: "י״ט"
+        case 20: "כ׳"
+        case 21: "כ״א"
+        case 22: "כ״ב"
+        case 23: "כ״ג"
+        case 24: "כ״ד"
+        case 25: "כ״ה"
+        case 26: "כ״ו"
+        case 27: "כ״ז"
+        case 28: "כ״ח"
+        case 29: "כ״ט"
+        case 30: "ל׳"
+        case 31: "ל״א"
+        default: "א׳"
+        }
+    }
+
+    private var hebrewOrdinalDayText: String {
+        switch Swift.min(Swift.max(self, 1), 31) {
+        case 1: "ראשון"
+        case 2: "שני"
+        case 3: "שלישי"
+        case 4: "רביעי"
+        case 5: "חמישי"
+        case 6: "שישי"
+        case 7: "שביעי"
+        case 8: "שמיני"
+        case 9: "תשיעי"
+        case 10: "עשירי"
+        case 11: "אחד עשר"
+        case 12: "שנים עשר"
+        case 13: "שלושה עשר"
+        case 14: "ארבעה עשר"
+        case 15: "חמישה עשר"
+        case 16: "שישה עשר"
+        case 17: "שבעה עשר"
+        case 18: "שמונה עשר"
+        case 19: "תשעה עשר"
+        case 20: "עשרים"
+        case 21: "עשרים ואחד"
+        case 22: "עשרים ושניים"
+        case 23: "עשרים ושלושה"
+        case 24: "עשרים וארבעה"
+        case 25: "עשרים וחמישה"
+        case 26: "עשרים ושישה"
+        case 27: "עשרים ושבעה"
+        case 28: "עשרים ושמונה"
+        case 29: "עשרים ותשעה"
+        case 30: "שלושים"
+        case 31: "שלושים ואחד"
+        default: "ראשון"
         }
     }
 }
@@ -10141,17 +11734,11 @@ private extension Date {
     }
 
     func shortDateText(for language: AppLanguage) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: language.localeIdentifier)
-        formatter.dateFormat = language == .he ? "dd.MM.yyyy" : "dd/MM/yyyy"
-        return formatter.string(from: self)
+        formattedDateText(for: language, style: .date)
     }
 
     func monthYearText(for language: AppLanguage) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: language.localeIdentifier)
-        formatter.dateFormat = language == .he ? "MM.yyyy" : "MM/yyyy"
-        return formatter.string(from: self)
+        formattedDateText(for: language, style: .monthYear)
     }
 
     var expenseDateTimeText: String {
@@ -10159,10 +11746,7 @@ private extension Date {
     }
 
     func expenseDateTimeText(for language: AppLanguage) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: language.localeIdentifier)
-        formatter.dateFormat = language == .he ? "dd.MM.yyyy, HH:mm" : "dd/MM/yyyy, HH:mm"
-        return formatter.string(from: self)
+        formattedDateText(for: language, style: .dateTime)
     }
 
     var restoreSnapshotDateText: String {
@@ -10170,27 +11754,326 @@ private extension Date {
     }
 
     func localizedDateTimeText(for language: AppLanguage) -> String {
+        formattedDateText(for: language, style: .dateTime)
+    }
+
+    private enum DisplayDateStyle {
+        case date
+        case dateTime
+        case monthYear
+    }
+
+    private func formattedDateText(for language: AppLanguage, style: DisplayDateStyle) -> String {
+        let displayFormat = Storage.loadDateDisplayFormat()
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: language.localeIdentifier)
-        formatter.dateFormat = language == .he ? "dd.MM.yyyy, HH:mm" : "dd/MM/yyyy, HH:mm"
+
+        if displayFormat == .hebrewCalendar {
+            formatter.calendar = Calendar(identifier: .hebrew)
+        }
+
+        switch style {
+        case .date:
+            formatter.dateFormat = displayFormat.dateFormat
+        case .dateTime:
+            formatter.dateFormat = displayFormat.dateTimeFormat
+        case .monthYear:
+            formatter.dateFormat = displayFormat.monthYearFormat
+        }
+
         return formatter.string(from: self)
     }
 }
 
+private struct CategoryAppearanceSymbolGroup: Identifiable {
+    let titleHE: String
+    let titleEN: String
+    let searchKeywords: [String]
+    let symbols: [String]
+
+    var id: String {
+        titleEN
+    }
+
+    func title(for language: AppLanguage) -> String {
+        language.text(he: titleHE, en: titleEN)
+    }
+}
+
 private enum CategoryAppearanceOption {
+    static let fallbackSystemImageName = "tag"
     static let defaultSystemImageName = "square.grid.2x2.fill"
     static let defaultTintName = "purple"
 
-    static let systemImages = [
-        "square.grid.2x2.fill",
-        "fork.knife",
-        "car.fill",
-        "house.fill",
-        "bag.fill",
-        "cross.case.fill",
-        "creditcard.fill",
-        "cart.fill"
+    static let symbolGroups: [CategoryAppearanceSymbolGroup] = [
+        CategoryAppearanceSymbolGroup(
+            titleHE: "אוכל",
+            titleEN: "Food",
+            searchKeywords: ["food", "meal", "restaurant", "coffee", "drink", "אוכל", "מסעדה", "קפה", "שתיה"],
+            symbols: [
+                "fork.knife", "cup.and.saucer", "takeoutbag.and.cup.and.straw", "cart", "cart.fill",
+                "basket", "basket.fill", "mug", "mug.fill", "wineglass", "birthday.cake",
+                "birthday.cake.fill", "waterbottle", "waterbottle.fill", "carrot", "carrot.fill",
+                "fish", "fish.fill", "popcorn", "popcorn.fill", "leaf", "leaf.fill",
+                "drop", "drop.fill", "flame", "flame.fill"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "תחבורה",
+            titleEN: "Transport",
+            searchKeywords: ["transport", "car", "bus", "train", "fuel", "flight", "תחבורה", "רכב", "אוטובוס", "דלק"],
+            symbols: [
+                "car", "car.fill", "car.circle", "car.circle.fill", "bus", "bus.fill",
+                "tram", "tram.fill", "airplane", "airplane.circle", "airplane.departure", "airplane.arrival",
+                "bicycle", "fuelpump", "fuelpump.fill", "parkingsign", "parkingsign.circle",
+                "parkingsign.circle.fill", "road.lanes", "road.lanes.curved.left", "figure.walk",
+                "figure.walk.circle", "figure.run", "sailboat", "sailboat.fill", "ferry",
+                "ferry.fill", "truck.box", "truck.box.fill", "box.truck", "box.truck.fill",
+                "bus.doubledecker", "bus.doubledecker.fill"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "בית",
+            titleEN: "Home",
+            searchKeywords: ["home", "house", "rent", "utilities", "wifi", "בית", "שכירות", "חשמל", "מים"],
+            symbols: [
+                "house", "house.fill", "house.circle", "house.circle.fill", "building.2",
+                "building.2.fill", "building.columns", "building.columns.fill", "lightbulb",
+                "lightbulb.fill", "lamp.table", "lamp.table.fill", "sofa", "sofa.fill",
+                "bed.double", "bed.double.fill", "shower", "shower.fill", "bathtub", "bathtub.fill",
+                "washer", "washer.fill", "dryer", "dryer.fill", "dishwasher", "dishwasher.fill",
+                "toilet", "toilet.fill", "wifi", "wifi.circle", "wifi.circle.fill", "thermometer",
+                "humidity", "humidity.fill", "fan", "fan.fill", "lock", "lock.fill",
+                "key", "key.fill"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "בריאות",
+            titleEN: "Health",
+            searchKeywords: ["health", "medical", "doctor", "medicine", "pharmacy", "בריאות", "רופא", "תרופה", "קופה"],
+            symbols: [
+                "cross", "cross.fill", "cross.case", "cross.case.fill", "heart",
+                "heart.fill", "heart.circle", "heart.circle.fill", "heart.text.square",
+                "heart.text.square.fill", "pills", "pills.fill", "stethoscope", "bandage",
+                "bandage.fill", "syringe", "syringe.fill", "staroflife", "staroflife.fill",
+                "facemask", "facemask.fill", "brain.head.profile", "lungs", "lungs.fill",
+                "waveform.path.ecg", "waveform.path.ecg.rectangle", "eye", "eye.fill",
+                "ear", "ear.badge.checkmark", "figure.mind.and.body", "figure.walk",
+                "figure.run", "figure.yoga"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "קניות",
+            titleEN: "Shopping",
+            searchKeywords: ["shopping", "shop", "store", "clothes", "gift", "קניות", "חנות", "בגדים", "מתנה"],
+            symbols: [
+                "bag", "bag.fill", "bag.circle", "bag.circle.fill", "cart", "cart.fill",
+                "cart.circle", "cart.circle.fill", "basket", "basket.fill", "tshirt",
+                "tshirt.fill", "shoe", "shoe.fill", "gift", "gift.fill", "gift.circle",
+                "shippingbox", "shippingbox.fill", "shippingbox.circle", "archivebox",
+                "archivebox.fill", "tag", "tag.fill", "tag.circle", "tag.circle.fill",
+                "barcode", "qrcode", "creditcard", "storefront", "storefront.fill",
+                "scalemass", "scalemass.fill"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "כספים",
+            titleEN: "Finance",
+            searchKeywords: ["finance", "money", "card", "bank", "cash", "budget", "כסף", "כרטיס", "בנק", "תקציב"],
+            symbols: [
+                "creditcard", "creditcard.fill", "creditcard.circle", "creditcard.circle.fill",
+                "banknote", "banknote.fill", "dollarsign", "dollarsign.circle",
+                "dollarsign.circle.fill", "dollarsign.square", "dollarsign.square.fill",
+                "shekelsign", "shekelsign.circle", "shekelsign.circle.fill", "shekelsign.square",
+                "eurosign", "eurosign.circle", "eurosign.circle.fill", "sterlingsign.circle",
+                "yensign.circle", "bitcoinsign.circle", "chart.pie", "chart.pie.fill",
+                "chart.bar", "chart.bar.fill", "chart.line.uptrend.xyaxis", "chart.line.downtrend.xyaxis",
+                "chart.xyaxis.line", "wallet.pass", "wallet.pass.fill", "percent",
+                "percent.ar", "number", "plus.forwardslash.minus", "equal.circle"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "עבודה וקבצים",
+            titleEN: "Work & Files",
+            searchKeywords: ["work", "office", "file", "folder", "document", "עבודה", "משרד", "קובץ", "תיקיה"],
+            symbols: [
+                "briefcase", "briefcase.fill", "case", "case.fill", "folder", "folder.fill",
+                "folder.circle", "folder.circle.fill", "folder.badge.plus", "folder.badge.minus",
+                "doc", "doc.fill", "doc.text", "doc.text.fill", "doc.richtext",
+                "doc.on.doc", "doc.on.doc.fill", "doc.badge.plus", "doc.badge.gearshape",
+                "doc.badge.ellipsis", "tray", "tray.fill", "tray.full", "tray.full.fill",
+                "archivebox", "archivebox.fill", "clipboard", "list.clipboard", "paperclip",
+                "paperplane", "paperplane.fill", "signature", "calendar", "calendar.badge.plus",
+                "calendar.badge.clock", "calendar.circle", "printer", "printer.fill",
+                "scanner", "faxmachine"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "לימודים",
+            titleEN: "Education",
+            searchKeywords: ["education", "school", "book", "learn", "study", "לימודים", "ספר", "בית ספר", "אוניברסיטה"],
+            symbols: [
+                "book", "book.fill", "book.closed", "book.closed.fill", "books.vertical",
+                "books.vertical.fill", "graduationcap", "graduationcap.fill", "studentdesk",
+                "pencil", "pencil.circle", "pencil.circle.fill", "pencil.and.outline",
+                "pencil.line", "pencil.tip", "highlighter", "text.book.closed",
+                "text.book.closed.fill", "character.book.closed", "bookmark", "bookmark.fill",
+                "bookmark.circle", "bookmark.circle.fill", "textformat", "textformat.abc",
+                "textformat.abc.dottedunderline", "text.alignleft", "list.bullet.rectangle",
+                "checklist", "note.text", "note.text.badge.plus"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "מכשירים ודיגיטל",
+            titleEN: "Devices & Digital",
+            searchKeywords: ["device", "phone", "computer", "digital", "subscription", "מכשיר", "טלפון", "מחשב", "מנוי"],
+            symbols: [
+                "iphone", "iphone.circle", "iphone.gen1", "iphone.gen2", "iphone.gen3",
+                "ipad", "ipad.landscape", "laptopcomputer", "desktopcomputer", "display",
+                "display.2", "applewatch", "applewatch.watchface", "keyboard", "keyboard.fill",
+                "computermouse", "computermouse.fill", "magicmouse", "magicmouse.fill",
+                "trackpad", "trackpad.fill", "headphones", "earbuds", "earbuds.case",
+                "hifispeaker", "hifispeaker.fill", "tv", "tv.fill", "gamecontroller",
+                "gamecontroller.fill", "camera", "camera.fill", "video", "video.fill",
+                "wifi", "antenna.radiowaves.left.and.right", "dot.radiowaves.left.and.right",
+                "app", "app.fill", "app.badge", "app.badge.fill", "bell", "bell.fill",
+                "icloud", "icloud.fill", "externaldrive", "externaldrive.fill",
+                "internaldrive", "internaldrive.fill", "battery.100", "powerplug", "powerplug.fill"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "אנשים ומשפחה",
+            titleEN: "People & Family",
+            searchKeywords: ["people", "family", "person", "child", "pet", "אנשים", "משפחה", "ילד", "חיות"],
+            symbols: [
+                "person", "person.fill", "person.circle", "person.circle.fill", "person.crop.circle",
+                "person.crop.circle.fill", "person.2", "person.2.fill", "person.3",
+                "person.3.fill", "person.badge.plus", "person.badge.minus", "person.badge.clock",
+                "person.text.rectangle", "figure.2.and.child.holdinghands", "figure.and.child.holdinghands",
+                "figure.walk", "figure.run", "figure.wave", "figure.roll", "figure.stand",
+                "figure.stand.line.dotted.figure.stand", "hands.clap", "hands.clap.fill",
+                "hand.raised", "hand.raised.fill", "hand.thumbsup", "hand.thumbsup.fill",
+                "hand.heart", "hand.heart.fill", "pawprint", "pawprint.fill", "teddybear",
+                "teddybear.fill"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "נסיעות וטבע",
+            titleEN: "Travel & Nature",
+            searchKeywords: ["travel", "trip", "vacation", "nature", "weather", "נסיעות", "טיול", "טבע", "מזג אוויר"],
+            symbols: [
+                "suitcase", "suitcase.fill", "map", "map.fill", "globe", "globe.europe.africa",
+                "globe.asia.australia", "globe.americas", "location", "location.fill",
+                "location.circle", "location.circle.fill", "mappin", "mappin.circle",
+                "mappin.and.ellipse", "tent", "tent.fill", "beach.umbrella",
+                "beach.umbrella.fill", "mountain.2", "mountain.2.fill", "tree",
+                "tree.fill", "leaf", "leaf.fill", "camera", "camera.fill", "binoculars",
+                "binoculars.fill", "sun.max", "sun.max.fill", "moon", "moon.fill",
+                "cloud", "cloud.fill", "cloud.rain", "cloud.rain.fill", "snowflake",
+                "wind", "rainbow"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "מדיה ובידור",
+            titleEN: "Media & Entertainment",
+            searchKeywords: ["media", "entertainment", "music", "movie", "game", "מדיה", "בידור", "מוזיקה", "סרט"],
+            symbols: [
+                "music.note", "music.note.list", "music.mic", "music.quarternote.3",
+                "play", "play.fill", "play.circle", "play.circle.fill", "pause",
+                "pause.fill", "stop", "stop.fill", "forward", "forward.fill",
+                "backward", "backward.fill", "shuffle", "repeat", "speaker",
+                "speaker.fill", "speaker.wave.2", "speaker.wave.2.fill", "mic",
+                "mic.fill", "mic.circle", "film", "film.fill", "movieclapper",
+                "movieclapper.fill", "theatermasks", "theatermasks.fill", "ticket",
+                "ticket.fill", "paintpalette", "paintpalette.fill", "photo", "photo.fill",
+                "photo.on.rectangle", "photo.stack", "camera.filters", "sparkles",
+                "wand.and.stars"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "תקשורת",
+            titleEN: "Communication",
+            searchKeywords: ["communication", "message", "mail", "phone", "chat", "תקשורת", "הודעה", "מייל", "טלפון"],
+            symbols: [
+                "phone", "phone.fill", "phone.circle", "phone.circle.fill", "phone.badge.plus",
+                "envelope", "envelope.fill", "envelope.circle", "envelope.circle.fill",
+                "message", "message.fill", "message.circle", "message.circle.fill",
+                "bubble.left", "bubble.left.fill", "bubble.right", "bubble.right.fill",
+                "bubble.left.and.bubble.right", "bubble.left.and.bubble.right.fill",
+                "quote.bubble", "quote.bubble.fill", "at", "at.circle", "at.circle.fill",
+                "paperplane", "paperplane.fill", "bell", "bell.fill", "bell.badge",
+                "bell.badge.fill", "megaphone", "megaphone.fill", "antenna.radiowaves.left.and.right"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "כלים ותחזוקה",
+            titleEN: "Tools & Maintenance",
+            searchKeywords: ["tool", "repair", "maintenance", "settings", "fix", "כלים", "תיקון", "תחזוקה", "הגדרות"],
+            symbols: [
+                "wrench", "wrench.fill", "hammer", "hammer.fill", "screwdriver",
+                "screwdriver.fill", "wrench.and.screwdriver", "wrench.and.screwdriver.fill",
+                "gear", "gearshape", "gearshape.fill", "slider.horizontal.3",
+                "slider.horizontal.2.square", "switch.2", "paintbrush", "paintbrush.fill",
+                "paintroller", "paintroller.fill", "eyedropper", "eyedropper.full",
+                "scissors", "ruler", "ruler.fill", "level", "level.fill",
+                "briefcase", "case", "lock", "lock.fill", "lock.open", "lock.open.fill",
+                "key", "key.fill", "trash", "trash.fill"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "סטטוס ובטיחות",
+            titleEN: "Status & Safety",
+            searchKeywords: ["status", "safety", "alert", "security", "warning", "סטטוס", "בטיחות", "אזהרה", "אבטחה"],
+            symbols: [
+                "checkmark", "checkmark.circle", "checkmark.circle.fill", "checkmark.square",
+                "checkmark.square.fill", "xmark", "xmark.circle", "xmark.circle.fill",
+                "xmark.square", "xmark.square.fill", "plus", "plus.circle", "plus.circle.fill",
+                "minus", "minus.circle", "minus.circle.fill", "exclamationmark.circle",
+                "exclamationmark.circle.fill", "exclamationmark.triangle", "exclamationmark.triangle.fill",
+                "info.circle", "info.circle.fill", "questionmark.circle", "questionmark.circle.fill",
+                "shield", "shield.fill", "shield.lefthalf.filled", "lock.shield",
+                "lock.shield.fill", "eye", "eye.fill", "eye.slash", "eye.slash.fill",
+                "flag", "flag.fill", "bookmark", "bookmark.fill"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "חיצים ופעולות",
+            titleEN: "Arrows & Actions",
+            searchKeywords: ["arrow", "action", "move", "direction", "upload", "חץ", "פעולה", "כיוון", "העלאה"],
+            symbols: [
+                "arrow.up", "arrow.down", "arrow.left", "arrow.right", "arrow.up.circle",
+                "arrow.down.circle", "arrow.left.circle", "arrow.right.circle",
+                "arrow.up.circle.fill", "arrow.down.circle.fill", "arrow.left.circle.fill",
+                "arrow.right.circle.fill", "arrow.up.square", "arrow.down.square",
+                "arrow.left.square", "arrow.right.square", "arrow.clockwise", "arrow.counterclockwise",
+                "arrow.2.circlepath", "arrow.triangle.2.circlepath", "arrow.up.arrow.down",
+                "arrow.left.arrow.right", "arrow.down.to.line", "arrow.up.to.line",
+                "arrow.down.doc", "arrow.up.doc", "square.and.arrow.up", "square.and.arrow.down",
+                "square.and.pencil", "pencil", "plus.app", "minus.plus.batteryblock",
+                "chevron.up", "chevron.down", "chevron.left", "chevron.right",
+                "chevron.up.circle", "chevron.down.circle", "chevron.left.circle", "chevron.right.circle"
+            ]
+        ),
+        CategoryAppearanceSymbolGroup(
+            titleHE: "צורות וכללי",
+            titleEN: "Shapes & General",
+            searchKeywords: ["general", "shape", "grid", "star", "tag", "כללי", "צורה", "כוכב", "תג"],
+            symbols: [
+                "tag", "tag.fill", "star", "star.fill", "star.circle", "star.circle.fill",
+                "heart", "heart.fill", "circle", "circle.fill", "circle.grid.3x3",
+                "circle.grid.3x3.fill", "square", "square.fill", "square.grid.2x2",
+                "square.grid.2x2.fill", "square.grid.3x3", "rectangle", "rectangle.fill",
+                "capsule", "capsule.fill", "triangle", "triangle.fill", "diamond",
+                "diamond.fill", "hexagon", "hexagon.fill", "seal", "seal.fill",
+                "rosette", "target", "scope", "smallcircle.filled.circle",
+                "ellipsis", "ellipsis.circle", "ellipsis.circle.fill", "line.3.horizontal",
+                "line.3.horizontal.circle", "line.3.horizontal.circle.fill", "list.bullet",
+                "list.bullet.circle", "magnifyingglass"
+            ]
+        )
     ]
+
+    static let systemImages = Array(Set(symbolGroups.flatMap(\.symbols) + [fallbackSystemImageName, defaultSystemImageName]))
 
     static let tintNames = [
         "purple",
@@ -10204,13 +12087,105 @@ private enum CategoryAppearanceOption {
     ]
 }
 
+private enum DateDisplayFormat: String, CaseIterable, Identifiable, Codable {
+    case dayMonthYear
+    case monthDayYear
+    case yearMonthDay
+    case dotDayMonthYear
+    case dayMonthNameYear
+    case hebrewCalendar
+
+    var id: String {
+        rawValue
+    }
+
+    func title(for language: AppLanguage) -> String {
+        switch self {
+        case .dayMonthYear:
+            language.text(he: "יום/חודש/שנה", en: "Day/Month/Year")
+        case .monthDayYear:
+            language.text(he: "חודש/יום/שנה", en: "Month/Day/Year")
+        case .yearMonthDay:
+            language.text(he: "שנה-חודש-יום", en: "Year-Month-Day")
+        case .dotDayMonthYear:
+            language.text(he: "יום.חודש.שנה", en: "Day.Month.Year")
+        case .dayMonthNameYear:
+            language.text(he: "יום - חודש בשם - שנה", en: "Day - Month Name - Year")
+        case .hebrewCalendar:
+            language.text(he: "תאריך עברי", en: "Hebrew Date")
+        }
+    }
+
+    var dateFormat: String {
+        switch self {
+        case .dayMonthYear:
+            "dd/MM/yyyy"
+        case .monthDayYear:
+            "MM/dd/yyyy"
+        case .yearMonthDay:
+            "yyyy-MM-dd"
+        case .dotDayMonthYear:
+            "dd.MM.yyyy"
+        case .dayMonthNameYear:
+            "d - MMMM - yyyy"
+        case .hebrewCalendar:
+            "d MMMM yyyy"
+        }
+    }
+
+    var dateTimeFormat: String {
+        switch self {
+        case .dayMonthYear:
+            "dd/MM/yyyy, HH:mm"
+        case .monthDayYear:
+            "MM/dd/yyyy, HH:mm"
+        case .yearMonthDay:
+            "yyyy-MM-dd, HH:mm"
+        case .dotDayMonthYear:
+            "dd.MM.yyyy, HH:mm"
+        case .dayMonthNameYear:
+            "d - MMMM - yyyy, HH:mm"
+        case .hebrewCalendar:
+            "d MMMM yyyy, HH:mm"
+        }
+    }
+
+    var monthYearFormat: String {
+        switch self {
+        case .dayMonthYear, .monthDayYear:
+            "MM/yyyy"
+        case .yearMonthDay:
+            "yyyy-MM"
+        case .dotDayMonthYear:
+            "MM.yyyy"
+        case .dayMonthNameYear:
+            "MMMM yyyy"
+        case .hebrewCalendar:
+            "MMMM yyyy"
+        }
+    }
+}
+
 private enum CurrencyOption: String, CaseIterable, Identifiable, Codable {
     case ils
     case usd
     case eur
+    case gbp
+    case jpy
+    case cad
+    case aud
+    case thb
 
     var id: String {
         rawValue
+    }
+
+    static func option(for code: String) -> CurrencyOption? {
+        CurrencyOption(rawValue: code.lowercased())
+    }
+
+    var code: String {
+        rawValue.uppercased()
     }
 
     var symbol: String {
@@ -10221,7 +12196,21 @@ private enum CurrencyOption: String, CaseIterable, Identifiable, Codable {
             "$"
         case .eur:
             "€"
+        case .gbp:
+            "£"
+        case .jpy:
+            "¥"
+        case .cad:
+            "C$"
+        case .aud:
+            "A$"
+        case .thb:
+            "฿"
         }
+    }
+
+    var selectorTitle: String {
+        "\(code) \(symbol)"
     }
 
     var title: String {
@@ -10236,7 +12225,204 @@ private enum CurrencyOption: String, CaseIterable, Identifiable, Codable {
             language.text(he: "$ דולר", en: "$ Dollar")
         case .eur:
             language.text(he: "€ אירו", en: "€ Euro")
+        case .gbp:
+            language.text(he: "£ לירה שטרלינג", en: "£ British Pound")
+        case .jpy:
+            language.text(he: "¥ ין יפני", en: "¥ Japanese Yen")
+        case .cad:
+            language.text(he: "C$ דולר קנדי", en: "C$ Canadian Dollar")
+        case .aud:
+            language.text(he: "A$ דולר אוסטרלי", en: "A$ Australian Dollar")
+        case .thb:
+            language.text(he: "฿ באט תאילנדי", en: "฿ Thai Baht")
         }
+    }
+}
+
+private struct CurrencyExchangeRate: Codable {
+    let currencyCode: String
+    let rateInILS: Decimal
+    let unit: Decimal
+    let rateDate: Date
+
+    var normalizedRateInILS: Decimal {
+        guard unit > 0 else {
+            return rateInILS
+        }
+
+        return rateInILS / unit
+    }
+}
+
+private struct CurrencyConversionResult {
+    let convertedAmount: Decimal
+    let exchangeRate: Decimal
+    let exchangeRateDate: Date
+}
+
+private enum CurrencyExchangeService {
+    private static let cacheRefreshInterval: TimeInterval = 24 * 60 * 60
+    private static let bankOfIsraelURL = URL(string: "https://boi.org.il/PublicApi/GetExchangeRates?asXML=false")
+
+    static func markRatesStale() {
+        UserDefaults.standard.removeObject(forKey: Storage.currencyRatesLastRefreshKey)
+    }
+
+    static func refreshIfNeeded() async {
+        guard shouldRefreshRates else {
+            return
+        }
+
+        await refreshRates()
+    }
+
+    static func convert(amount: Decimal, from sourceCurrency: CurrencyOption, to targetCurrency: CurrencyOption) -> CurrencyConversionResult? {
+        guard amount > 0 else {
+            return nil
+        }
+
+        if sourceCurrency == targetCurrency {
+            return CurrencyConversionResult(convertedAmount: amount, exchangeRate: 1, exchangeRateDate: Date())
+        }
+
+        var rates = Storage.loadCurrencyExchangeRates()
+        rates["ILS"] = CurrencyExchangeRate(currencyCode: "ILS", rateInILS: 1, unit: 1, rateDate: Date())
+
+        guard let sourceRate = rates[sourceCurrency.code],
+              let targetRate = rates[targetCurrency.code],
+              sourceRate.normalizedRateInILS > 0,
+              targetRate.normalizedRateInILS > 0 else {
+            return nil
+        }
+
+        let amountInILS = amount * sourceRate.normalizedRateInILS
+        let convertedAmount = amountInILS / targetRate.normalizedRateInILS
+        let directRate = sourceRate.normalizedRateInILS / targetRate.normalizedRateInILS
+        let rateDate = min(sourceRate.rateDate, targetRate.rateDate)
+
+        return CurrencyConversionResult(
+            convertedAmount: convertedAmount.roundedCurrencyAmount,
+            exchangeRate: directRate,
+            exchangeRateDate: rateDate
+        )
+    }
+
+    private static var shouldRefreshRates: Bool {
+        guard let lastRefresh = UserDefaults.standard.object(forKey: Storage.currencyRatesLastRefreshKey) as? Date else {
+            return true
+        }
+
+        return Date().timeIntervalSince(lastRefresh) >= cacheRefreshInterval
+    }
+
+    private static func refreshRates() async {
+        guard let bankOfIsraelURL else {
+            return
+        }
+
+        do {
+            let (data, _) = try await URLSession.shared.data(from: bankOfIsraelURL)
+            let rates = try BankOfIsraelExchangeRateParser.parse(data: data)
+
+            guard !rates.isEmpty else {
+                return
+            }
+
+            Storage.saveCurrencyExchangeRates(rates)
+            UserDefaults.standard.set(Date(), forKey: Storage.currencyRatesLastRefreshKey)
+        } catch {
+            return
+        }
+    }
+}
+
+private enum BankOfIsraelExchangeRateParser {
+    static func parse(data: Data) throws -> [String: CurrencyExchangeRate] {
+        let json = try JSONSerialization.jsonObject(with: data)
+        let objects = collectDictionaries(from: json)
+        var rates: [String: CurrencyExchangeRate] = [:]
+
+        for object in objects {
+            guard let code = stringValue(object, keys: ["key", "currency", "currencyCode", "code"])?.uppercased(),
+                  CurrencyOption.allCases.contains(where: { $0.code == code }),
+                  let rate = decimalValue(object, keys: ["currentExchangeRate", "rate", "exchangeRate"]),
+                  rate > 0 else {
+                continue
+            }
+
+            let unit = decimalValue(object, keys: ["unit", "currencyUnits", "units"]) ?? 1
+            let date = dateValue(object, keys: ["lastUpdate", "date", "rateDate"]) ?? Date()
+            rates[code] = CurrencyExchangeRate(currencyCode: code, rateInILS: rate, unit: unit, rateDate: date)
+        }
+
+        rates["ILS"] = CurrencyExchangeRate(currencyCode: "ILS", rateInILS: 1, unit: 1, rateDate: Date())
+        return rates
+    }
+
+    private static func collectDictionaries(from value: Any) -> [[String: Any]] {
+        if let dictionary = value as? [String: Any] {
+            return [dictionary] + dictionary.values.flatMap { collectDictionaries(from: $0) }
+        }
+
+        if let array = value as? [Any] {
+            return array.flatMap { collectDictionaries(from: $0) }
+        }
+
+        return []
+    }
+
+    private static func stringValue(_ object: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = object[key] as? String, !value.isEmpty {
+                return value
+            }
+        }
+
+        return nil
+    }
+
+    private static func decimalValue(_ object: [String: Any], keys: [String]) -> Decimal? {
+        for key in keys {
+            if let decimal = object[key] as? Decimal {
+                return decimal
+            }
+
+            if let number = object[key] as? NSNumber {
+                return number.decimalValue
+            }
+
+            if let string = object[key] as? String,
+               let decimal = Decimal(string: string, locale: Locale(identifier: "en_US_POSIX")) {
+                return decimal
+            }
+        }
+
+        return nil
+    }
+
+    private static func dateValue(_ object: [String: Any], keys: [String]) -> Date? {
+        for key in keys {
+            guard let string = object[key] as? String else {
+                continue
+            }
+
+            if let date = ISO8601DateFormatter().date(from: string) {
+                return date
+            }
+
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+
+            for format in ["yyyy-MM-dd", "dd/MM/yyyy", "yyyy-MM-dd'T'HH:mm:ss"] {
+                formatter.dateFormat = format
+
+                if let date = formatter.date(from: string) {
+                    return date
+                }
+            }
+        }
+
+        return nil
     }
 }
 
@@ -10266,9 +12452,7 @@ private struct CategoryMonthlyTargetStatus {
 }
 
 private func netExpenseTotal(for expenses: [Expense]) -> Decimal {
-    max(expenses.reduce(Decimal(0)) { total, expense in
-        total + expense.netAmount
-    }, 0)
+    ExpenseCalculations.netExpenseTotal(expenses.map(\.netAmount))
 }
 
 private func netExpenseTotalByCategory(for expenses: [Expense]) -> Decimal {
@@ -10287,7 +12471,8 @@ private func categoryMonthlyTargetStatus(category: ExpenseCategory, expenses: [E
     }
 
     let monthlyExpenses = expenses.filter { expense in
-        expense.categoryId == category.id && Calendar.current.isDate(expense.date, equalTo: month, toGranularity: .month)
+        expense.categoryId == category.id
+            && ExpenseCalculations.isDate(expense.date, inSameMonthAs: month)
     }
 
     return CategoryMonthlyTargetStatus(
@@ -10335,15 +12520,15 @@ private enum AppLanguage: String, CaseIterable, Identifiable, Codable {
     }
 
     var textAlignment: TextAlignment {
-        self == .he ? .trailing : .leading
+        .leading
     }
 
     var horizontalAlignment: HorizontalAlignment {
-        self == .he ? .trailing : .leading
+        .leading
     }
 
     var frameAlignment: Alignment {
-        self == .he ? .trailing : .leading
+        .leading
     }
 
     func text(he: String, en: String) -> String {
@@ -10555,7 +12740,7 @@ private enum SavingLocation: String, CaseIterable, Identifiable, Codable {
         case .cash:
             language.text(he: "מזומן", en: "Cash")
         case .investmentPortfolio:
-            language.text(he: "תיק השקעות", en: "Investment Portfolio")
+            language.text(he: "בורסה", en: "Brokerage")
         case .deposit:
             language.text(he: "פיקדון", en: "Deposit")
         case .other:
@@ -10668,14 +12853,14 @@ private struct Saving: Identifiable, Codable {
     }
 
     static func balance(for savings: [Saving]) -> Decimal {
-        savings.reduce(Decimal(0)) { total, saving in
-            switch saving.kind {
-            case .deposit:
-                return total + saving.amount
-            case .withdrawal:
-                return total - saving.amount
-            }
-        }
+        let deposits = savings
+            .filter { $0.kind == .deposit }
+            .reduce(Decimal(0)) { $0 + $1.amount }
+        let withdrawals = savings
+            .filter { $0.kind == .withdrawal }
+            .reduce(Decimal(0)) { $0 + $1.amount }
+
+        return ExpenseCalculations.savingsBalance(deposits: deposits, withdrawals: withdrawals)
     }
 
     static func balance(for savings: [Saving], goalId: UUID) -> Decimal {
@@ -10866,15 +13051,11 @@ private struct Debt: Identifiable, Codable {
     }
 
     var remainingAmount: Decimal {
-        max(originalAmount - repaidAmount, 0)
+        ExpenseCalculations.debtRemaining(originalAmount: originalAmount, repaidAmount: repaidAmount)
     }
 
     var repaymentPercentage: Decimal {
-        guard originalAmount > 0 else {
-            return 0
-        }
-
-        return repaidAmount / originalAmount * 100
+        ExpenseCalculations.debtRepaymentPercentage(originalAmount: originalAmount, repaidAmount: repaidAmount)
     }
 
     var repaymentProgress: Double {
@@ -11165,6 +13346,12 @@ private struct Expense: Identifiable, Codable {
     let name: String?
     let isRecurring: Bool
     let source: ExpenseSource
+    let originalAmount: Decimal
+    let originalCurrencyCode: String
+    let exchangeRate: Decimal
+    let exchangeRateDate: Date
+    let convertedAmount: Decimal
+    let convertedCurrencyCode: String
 
     init(
         id: UUID = UUID(),
@@ -11177,7 +13364,13 @@ private struct Expense: Identifiable, Codable {
         date: Date? = nil,
         name: String?,
         isRecurring: Bool = false,
-        source: ExpenseSource = .regular
+        source: ExpenseSource = .regular,
+        originalAmount: Decimal? = nil,
+        originalCurrencyCode: String? = nil,
+        exchangeRate: Decimal = 1,
+        exchangeRateDate: Date = Date(),
+        convertedAmount: Decimal? = nil,
+        convertedCurrencyCode: String? = nil
     ) {
         self.id = id
         self.categoryId = categoryId
@@ -11190,6 +13383,12 @@ private struct Expense: Identifiable, Codable {
         self.name = name
         self.isRecurring = isRecurring
         self.source = source
+        self.originalAmount = originalAmount ?? amount
+        self.originalCurrencyCode = originalCurrencyCode ?? Storage.loadCurrency().code
+        self.exchangeRate = exchangeRate
+        self.exchangeRateDate = exchangeRateDate
+        self.convertedAmount = convertedAmount ?? amount
+        self.convertedCurrencyCode = convertedCurrencyCode ?? Storage.loadCurrency().code
     }
 
     enum CodingKeys: String, CodingKey {
@@ -11204,6 +13403,12 @@ private struct Expense: Identifiable, Codable {
         case name
         case isRecurring
         case source
+        case originalAmount
+        case originalCurrencyCode
+        case exchangeRate
+        case exchangeRateDate
+        case convertedAmount
+        case convertedCurrencyCode
     }
 
     init(from decoder: Decoder) throws {
@@ -11221,6 +13426,12 @@ private struct Expense: Identifiable, Codable {
         name = try container.decodeIfPresent(String.self, forKey: .name)
         isRecurring = try container.decodeIfPresent(Bool.self, forKey: .isRecurring) ?? false
         source = try container.decodeIfPresent(ExpenseSource.self, forKey: .source) ?? .regular
+        originalAmount = try container.decodeIfPresent(Decimal.self, forKey: .originalAmount) ?? amount
+        originalCurrencyCode = try container.decodeIfPresent(String.self, forKey: .originalCurrencyCode) ?? Storage.loadCurrency().code
+        exchangeRate = try container.decodeIfPresent(Decimal.self, forKey: .exchangeRate) ?? 1
+        exchangeRateDate = try container.decodeIfPresent(Date.self, forKey: .exchangeRateDate) ?? createdAt
+        convertedAmount = try container.decodeIfPresent(Decimal.self, forKey: .convertedAmount) ?? amount
+        convertedCurrencyCode = try container.decodeIfPresent(String.self, forKey: .convertedCurrencyCode) ?? Storage.loadCurrency().code
     }
 
     func displayCategoryName(for language: AppLanguage) -> String {
@@ -11228,7 +13439,7 @@ private struct Expense: Identifiable, Codable {
     }
 
     func withName(_ name: String) -> Expense {
-        Expense(
+        return Expense(
             id: id,
             categoryId: categoryId,
             categoryName: categoryName,
@@ -11239,12 +13450,18 @@ private struct Expense: Identifiable, Codable {
             date: date,
             name: name,
             isRecurring: isRecurring,
-            source: source
+            source: source,
+            originalAmount: originalAmount,
+            originalCurrencyCode: originalCurrencyCode,
+            exchangeRate: exchangeRate,
+            exchangeRateDate: exchangeRateDate,
+            convertedAmount: convertedAmount,
+            convertedCurrencyCode: convertedCurrencyCode
         )
     }
 
     func withCategory(_ category: ExpenseCategory) -> Expense {
-        Expense(
+        return Expense(
             id: id,
             categoryId: category.id,
             categoryName: category.name,
@@ -11255,12 +13472,26 @@ private struct Expense: Identifiable, Codable {
             date: date,
             name: name,
             isRecurring: isRecurring,
-            source: source
+            source: source,
+            originalAmount: originalAmount,
+            originalCurrencyCode: originalCurrencyCode,
+            exchangeRate: exchangeRate,
+            exchangeRateDate: exchangeRateDate,
+            convertedAmount: convertedAmount,
+            convertedCurrencyCode: convertedCurrencyCode
         )
     }
 
-    func updated(category: ExpenseCategory, amount: Decimal, refundedAmount: Decimal, date: Date, name: String) -> Expense {
-        Expense(
+    func updated(
+        category: ExpenseCategory,
+        amount: Decimal,
+        refundedAmount: Decimal,
+        date: Date,
+        name: String
+    ) -> Expense {
+        let primaryCurrency = Storage.loadCurrency()
+
+        return Expense(
             id: id,
             categoryId: category.id,
             categoryName: category.name,
@@ -11271,12 +13502,18 @@ private struct Expense: Identifiable, Codable {
             date: date,
             name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : name,
             isRecurring: isRecurring,
-            source: source
+            source: source,
+            originalAmount: amount,
+            originalCurrencyCode: primaryCurrency.code,
+            exchangeRate: 1,
+            exchangeRateDate: Date(),
+            convertedAmount: amount,
+            convertedCurrencyCode: primaryCurrency.code
         )
     }
 
     var netAmount: Decimal {
-        max(amount - refundedAmount, 0)
+        ExpenseCalculations.netExpenseAmount(amount: amount, refundedAmount: refundedAmount)
     }
 
     var refundStatus: ExpenseRefundStatus {
@@ -11303,14 +13540,25 @@ private struct Expense: Identifiable, Codable {
     }
 
     func refundSummaryText(for language: AppLanguage) -> String? {
+        let originalDetails: String? = originalCurrencyCode == convertedCurrencyCode ? nil : language.text(
+            he: "מקור: \(originalAmount.plainString) \(originalCurrencyCode) · מומר: \(convertedAmount.formattedShekelAmount)",
+            en: "Original: \(originalAmount.plainString) \(originalCurrencyCode) · Converted: \(convertedAmount.formattedShekelAmount)"
+        )
+
         guard refundedAmount > 0 else {
-            return nil
+            return originalDetails
         }
 
-        return language.text(
+        let refundSummary = language.text(
             he: "מקורי: \(amount.formattedShekelAmount) · הוחזר: \(refundedAmount.formattedShekelAmount) · נטו: \(netAmount.formattedShekelAmount)",
             en: "Original: \(amount.formattedShekelAmount) · Refunded: \(refundedAmount.formattedShekelAmount) · Net: \(netAmount.formattedShekelAmount)"
         )
+
+        if let originalDetails {
+            return "\(originalDetails) · \(refundSummary)"
+        }
+
+        return refundSummary
     }
 }
 
@@ -11348,6 +13596,8 @@ private struct RestoreSnapshot: Identifiable, Codable {
     let expenses: [Expense]
     let recurringExpenses: [RecurringExpense]
     let savings: [Saving]
+    let savingGoals: [SavingGoal]
+    let recurringSavings: [RecurringSaving]
     let debts: [Debt]
     let salaryEntries: [SalaryEntry]
     let categories: [ExpenseCategory]
@@ -11359,12 +13609,34 @@ private struct RestoreSnapshot: Identifiable, Codable {
     let checkingBalance: Decimal?
     let savingsGoal: Decimal?
 
+    enum CodingKeys: String, CodingKey {
+        case id
+        case createdAt
+        case expenses
+        case recurringExpenses
+        case savings
+        case savingGoals
+        case recurringSavings
+        case debts
+        case salaryEntries
+        case categories
+        case deletedCategoryBuckets
+        case userName
+        case currency
+        case appLanguage
+        case salaryReceiptDay
+        case checkingBalance
+        case savingsGoal
+    }
+
     init(
         id: UUID = UUID(),
         createdAt: Date,
         expenses: [Expense],
         recurringExpenses: [RecurringExpense],
         savings: [Saving],
+        savingGoals: [SavingGoal] = [],
+        recurringSavings: [RecurringSaving] = [],
         debts: [Debt],
         salaryEntries: [SalaryEntry],
         categories: [ExpenseCategory],
@@ -11381,6 +13653,8 @@ private struct RestoreSnapshot: Identifiable, Codable {
         self.expenses = expenses
         self.recurringExpenses = recurringExpenses
         self.savings = savings
+        self.savingGoals = savingGoals
+        self.recurringSavings = recurringSavings
         self.debts = debts
         self.salaryEntries = salaryEntries
         self.categories = categories
@@ -11391,6 +13665,28 @@ private struct RestoreSnapshot: Identifiable, Codable {
         self.salaryReceiptDay = salaryReceiptDay
         self.checkingBalance = checkingBalance
         self.savingsGoal = savingsGoal
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        id = try container.decode(UUID.self, forKey: .id)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        expenses = try container.decode([Expense].self, forKey: .expenses)
+        recurringExpenses = try container.decode([RecurringExpense].self, forKey: .recurringExpenses)
+        savings = try container.decode([Saving].self, forKey: .savings)
+        savingGoals = try container.decodeIfPresent([SavingGoal].self, forKey: .savingGoals) ?? []
+        recurringSavings = try container.decodeIfPresent([RecurringSaving].self, forKey: .recurringSavings) ?? []
+        debts = try container.decode([Debt].self, forKey: .debts)
+        salaryEntries = try container.decode([SalaryEntry].self, forKey: .salaryEntries)
+        categories = try container.decode([ExpenseCategory].self, forKey: .categories)
+        deletedCategoryBuckets = try container.decode([DeletedCategoryBucket].self, forKey: .deletedCategoryBuckets)
+        userName = try container.decode(String.self, forKey: .userName)
+        currency = try container.decode(CurrencyOption.self, forKey: .currency)
+        appLanguage = try container.decode(AppLanguage.self, forKey: .appLanguage)
+        salaryReceiptDay = try container.decode(Int.self, forKey: .salaryReceiptDay)
+        checkingBalance = try container.decodeIfPresent(Decimal.self, forKey: .checkingBalance)
+        savingsGoal = try container.decodeIfPresent(Decimal.self, forKey: .savingsGoal)
     }
 
     var displayTitle: String {
@@ -11418,11 +13714,19 @@ private enum Storage {
     private static let restoreSnapshotsKey = "restoreSnapshots"
     private static let appThemeKey = "appTheme"
     private static let userNameKey = "userName"
+    private static let initialSetupCompletedKey = "initialSetupCompleted"
     private static let savingsGoalKey = "savingsGoal"
     private static let currencyKey = "currency"
     private static let appLanguageKey = "appLanguage"
+    private static let dateDisplayFormatKey = "dateDisplayFormat"
     private static let salaryReceiptDayKey = "salaryReceiptDay"
     private static let checkingBalanceKey = "checkingBalance"
+    private static let monthlyAnalyticsSnapshotsKey = "monthlyAnalyticsSnapshots"
+    private static let currencyExchangeRatesKey = "currencyExchangeRates"
+    private static let temporaryCurrencyKey = "temporaryCurrency"
+    private static let temporaryCurrencyStartDateKey = "temporaryCurrencyStartDate"
+    private static let temporaryCurrencyExpirationDateKey = "temporaryCurrencyExpirationDate"
+    static let currencyRatesLastRefreshKey = "currencyRatesLastRefresh"
 
     static func loadExpenses() -> [Expense] {
         guard let data = UserDefaults.standard.data(forKey: expensesKey) else {
@@ -11627,6 +13931,72 @@ private enum Storage {
         UserDefaults.standard.set(currency.rawValue, forKey: currencyKey)
     }
 
+    static func loadTemporaryCurrency(primaryCurrency: CurrencyOption) -> CurrencyOption {
+        let now = Date()
+
+        if let expirationDate = loadTemporaryCurrencyExpirationDate(), expirationDate <= now {
+            clearTemporaryCurrency()
+            return primaryCurrency
+        }
+
+        if let startDate = loadTemporaryCurrencyStartDate(), startDate > now {
+            return primaryCurrency
+        }
+
+        guard let rawValue = UserDefaults.standard.string(forKey: temporaryCurrencyKey),
+              let currency = CurrencyOption(rawValue: rawValue) else {
+            return primaryCurrency
+        }
+
+        return currency
+    }
+
+    static func loadStoredTemporaryCurrency() -> CurrencyOption? {
+        guard let rawValue = UserDefaults.standard.string(forKey: temporaryCurrencyKey) else {
+            return nil
+        }
+
+        return CurrencyOption(rawValue: rawValue)
+    }
+
+    static func saveTemporaryCurrency(_ currency: CurrencyOption, startDate: Date, expirationDate: Date) {
+        UserDefaults.standard.set(currency.rawValue, forKey: temporaryCurrencyKey)
+        UserDefaults.standard.set(startDate, forKey: temporaryCurrencyStartDateKey)
+        UserDefaults.standard.set(expirationDate, forKey: temporaryCurrencyExpirationDateKey)
+    }
+
+    static func loadTemporaryCurrencyStartDate() -> Date? {
+        UserDefaults.standard.object(forKey: temporaryCurrencyStartDateKey) as? Date
+    }
+
+    static func loadTemporaryCurrencyExpirationDate() -> Date? {
+        UserDefaults.standard.object(forKey: temporaryCurrencyExpirationDateKey) as? Date
+    }
+
+    static func clearTemporaryCurrency() {
+        UserDefaults.standard.removeObject(forKey: temporaryCurrencyKey)
+        UserDefaults.standard.removeObject(forKey: temporaryCurrencyStartDateKey)
+        UserDefaults.standard.removeObject(forKey: temporaryCurrencyExpirationDateKey)
+    }
+
+    static func loadCurrencyExchangeRates() -> [String: CurrencyExchangeRate] {
+        guard let data = UserDefaults.standard.data(forKey: currencyExchangeRatesKey) else {
+            return ["ILS": CurrencyExchangeRate(currencyCode: "ILS", rateInILS: 1, unit: 1, rateDate: Date())]
+        }
+
+        var rates = (try? JSONDecoder().decode([String: CurrencyExchangeRate].self, from: data)) ?? [:]
+        rates["ILS"] = CurrencyExchangeRate(currencyCode: "ILS", rateInILS: 1, unit: 1, rateDate: Date())
+        return rates
+    }
+
+    static func saveCurrencyExchangeRates(_ rates: [String: CurrencyExchangeRate]) {
+        guard let data = try? JSONEncoder().encode(rates) else {
+            return
+        }
+
+        UserDefaults.standard.set(data, forKey: currencyExchangeRatesKey)
+    }
+
     static func loadAppLanguage() -> AppLanguage {
         guard let rawValue = UserDefaults.standard.string(forKey: appLanguageKey),
               let language = AppLanguage(rawValue: rawValue) else {
@@ -11638,6 +14008,19 @@ private enum Storage {
 
     static func saveAppLanguage(_ language: AppLanguage) {
         UserDefaults.standard.set(language.rawValue, forKey: appLanguageKey)
+    }
+
+    static func loadDateDisplayFormat() -> DateDisplayFormat {
+        guard let rawValue = UserDefaults.standard.string(forKey: dateDisplayFormatKey),
+              let format = DateDisplayFormat(rawValue: rawValue) else {
+            return .dayMonthYear
+        }
+
+        return format
+    }
+
+    static func saveDateDisplayFormat(_ format: DateDisplayFormat) {
+        UserDefaults.standard.set(format.rawValue, forKey: dateDisplayFormatKey)
     }
 
     static func loadSalaryReceiptDay() -> Int {
@@ -11685,6 +14068,74 @@ private enum Storage {
         UserDefaults.standard.set(goal.plainString, forKey: savingsGoalKey)
     }
 
+    static func loadMonthlyAnalyticsSnapshots() -> [String: MonthlyAnalyticsSnapshot] {
+        guard let data = UserDefaults.standard.data(forKey: monthlyAnalyticsSnapshotsKey) else {
+            return [:]
+        }
+
+        return (try? JSONDecoder().decode([String: MonthlyAnalyticsSnapshot].self, from: data)) ?? [:]
+    }
+
+    static func saveMonthlyAnalyticsSnapshots(_ snapshots: [String: MonthlyAnalyticsSnapshot]) {
+        guard let data = try? JSONEncoder().encode(snapshots) else {
+            return
+        }
+
+        UserDefaults.standard.set(data, forKey: monthlyAnalyticsSnapshotsKey)
+    }
+
+    static func saveMonthlyAnalyticsSnapshot(_ snapshot: MonthlyAnalyticsSnapshot) {
+        var snapshots = loadMonthlyAnalyticsSnapshots()
+        snapshots[snapshot.id] = snapshot
+        saveMonthlyAnalyticsSnapshots(snapshots)
+    }
+
+    static func isInitialSetupCompleted() -> Bool {
+        if UserDefaults.standard.object(forKey: initialSetupCompletedKey) != nil {
+            return UserDefaults.standard.bool(forKey: initialSetupCompletedKey)
+                && isValidSetupUserName(loadUserName() ?? "")
+        }
+
+        return isValidSetupUserName(loadUserName() ?? "")
+    }
+
+    static func saveInitialSetupCompleted(_ isCompleted: Bool) {
+        UserDefaults.standard.set(isCompleted, forKey: initialSetupCompletedKey)
+    }
+
+    static func resetAllAppData() {
+        [
+            expensesKey,
+            recurringExpensesKey,
+            savingsKey,
+            savingGoalsKey,
+            recurringSavingsKey,
+            debtsKey,
+            salaryEntriesKey,
+            categoriesKey,
+            deletedCategoryBucketsKey,
+            appThemeKey,
+            userNameKey,
+            savingsGoalKey,
+            currencyKey,
+            appLanguageKey,
+            dateDisplayFormatKey,
+            salaryReceiptDayKey,
+            checkingBalanceKey,
+            monthlyAnalyticsSnapshotsKey,
+            currencyExchangeRatesKey,
+            temporaryCurrencyKey,
+            temporaryCurrencyStartDateKey,
+            temporaryCurrencyExpirationDateKey,
+            currencyRatesLastRefreshKey
+        ].forEach { key in
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+
+        saveCategories(ExpenseCategory.placeholderCategories)
+        saveInitialSetupCompleted(false)
+    }
+
     #if DEBUG
     private static let debugFoodExpenseID = UUID(uuidString: "00000000-0000-0000-0000-00000000A001")!
     private static let debugShoppingExpenseID = UUID(uuidString: "00000000-0000-0000-0000-00000000A002")!
@@ -11694,6 +14145,7 @@ private enum Storage {
     private static let debugSavingDepositID = UUID(uuidString: "00000000-0000-0000-0000-00000000B002")!
     private static let debugSavingWithdrawalID = UUID(uuidString: "00000000-0000-0000-0000-00000000B003")!
     private static let debugSalaryEntryID = UUID(uuidString: "00000000-0000-0000-0000-00000000C001")!
+    private static let debugIOweDebtID = UUID(uuidString: "00000000-0000-0000-0000-00000000D003")!
 
     static func createDebugQATestData() {
         clearDebugQATestData()
@@ -11704,6 +14156,7 @@ private enum Storage {
         let savingDate = debugDate(year: 2026, month: 7, day: 10, hour: 13)
         let withdrawalDate = debugDate(year: 2026, month: 7, day: 11, hour: 13)
         let salaryDate = debugDate(year: 2026, month: 7, day: 1, hour: 9)
+        let futureExpenseDate = debugDate(year: 2026, month: 8, day: 3, hour: 10)
 
         var categories = loadCategories(defaults: ExpenseCategory.placeholderCategories)
         categories = categories.map { category in
@@ -11718,6 +14171,12 @@ private enum Storage {
                 monthlyTarget: 100
             )
         }
+        categories.append(contentsOf: [
+            ExpenseCategory(id: "qa-below-target", name: "QA Below Target", systemImageName: "chart.bar", tintName: "green", monthlyTarget: 500),
+            ExpenseCategory(id: "qa-exact-target", name: "QA Exact Target", systemImageName: "equal.circle", tintName: "blue", monthlyTarget: 300),
+            ExpenseCategory(id: "qa-over-target", name: "QA Over Target", systemImageName: "exclamationmark.triangle", tintName: "red", monthlyTarget: 800),
+            ExpenseCategory(id: "qa-no-target-long-category-name-for-layout-check", name: "QA Very Long Category Name For Layout And Wrapping", systemImageName: "textformat.size", tintName: "purple", monthlyTarget: nil)
+        ])
         saveCategories(categories)
 
         var expenses = loadExpenses()
@@ -11741,8 +14200,66 @@ private enum Storage {
                 createdAt: shoppingDate,
                 date: shoppingDate,
                 name: "QA Shopping Full Refund"
+            ),
+            Expense(
+                id: debugUUID(101),
+                categoryId: "qa-below-target",
+                categoryName: "QA Below Target",
+                amount: 450,
+                createdAt: foodDate,
+                date: foodDate,
+                name: "QA Below Target July"
+            ),
+            Expense(
+                id: debugUUID(102),
+                categoryId: "qa-exact-target",
+                categoryName: "QA Exact Target",
+                amount: 300,
+                createdAt: foodDate,
+                date: foodDate,
+                name: "QA Exact Target July"
+            ),
+            Expense(
+                id: debugUUID(103),
+                categoryId: "qa-over-target",
+                categoryName: "QA Over Target",
+                amount: 900,
+                createdAt: foodDate,
+                date: foodDate,
+                name: "QA Over Target July"
+            ),
+            Expense(
+                id: debugUUID(104),
+                categoryId: "qa-no-target-long-category-name-for-layout-check",
+                categoryName: "QA Very Long Category Name For Layout And Wrapping",
+                amount: 123456,
+                refundedAmount: 3456,
+                createdAt: foodDate,
+                date: foodDate,
+                name: "QA Large Amount Long Category"
+            ),
+            Expense(
+                id: debugUUID(105),
+                categoryId: "food",
+                categoryName: "אוכל",
+                amount: 9999,
+                createdAt: futureExpenseDate,
+                date: futureExpenseDate,
+                name: "QA Future Expense Must Not Affect July"
             )
         ])
+        for month in 1...12 {
+            let monthDate = debugDate(year: 2026, month: month, day: 15, hour: 10)
+            expenses.append(Expense(
+                id: debugUUID(200 + month),
+                categoryId: "qa-below-target",
+                categoryName: "QA Below Target",
+                amount: Decimal(50 + month),
+                createdAt: monthDate,
+                date: monthDate,
+                name: "QA 12 Month Expense \(month)"
+            ))
+        }
         saveExpenses(expenses.sorted { $0.date > $1.date })
 
         var debts = loadDebts()
@@ -11767,6 +14284,17 @@ private enum Storage {
                 reason: "QA fully repaid debt",
                 date: debtDate,
                 returnedAt: debtDate,
+                createdAt: debtDate
+            ),
+            Debt(
+                id: debugIOweDebtID,
+                direction: .iOwe,
+                personName: "QA Debt I Owe",
+                originalAmount: 750,
+                repaidAmount: 250,
+                reason: "QA opposite debt direction",
+                date: debtDate,
+                returnedAt: nil,
                 createdAt: debtDate
             )
         ])
@@ -11819,11 +14347,24 @@ private enum Storage {
     }
 
     static func clearDebugQATestData() {
-        saveExpenses(loadExpenses().filter { ![debugFoodExpenseID, debugShoppingExpenseID].contains($0.id) })
-        saveDebts(loadDebts().filter { ![debugOpenDebtID, debugRepaidDebtID].contains($0.id) })
-        saveSavingGoals(loadSavingGoals().filter { $0.id != debugSavingGoalID })
+        saveExpenses(loadExpenses().filter { expense in
+            ![debugFoodExpenseID, debugShoppingExpenseID].contains(expense.id)
+                && !(expense.name ?? "").hasPrefix("QA ")
+        })
+        saveDebts(loadDebts().filter { debt in
+            ![debugOpenDebtID, debugRepaidDebtID, debugIOweDebtID].contains(debt.id)
+                && !debt.personName.hasPrefix("QA ")
+        })
+        saveSavingGoals(loadSavingGoals().filter { goal in
+            goal.id != debugSavingGoalID && !goal.name.hasPrefix("QA ")
+        })
+        saveCategories(loadCategories(defaults: ExpenseCategory.placeholderCategories).filter { !$0.id.hasPrefix("qa-") })
         saveSavings(loadSavings().filter { ![debugSavingDepositID, debugSavingWithdrawalID].contains($0.id) })
         saveSalaryEntries(loadSalaryEntries().filter { $0.id != debugSalaryEntryID })
+    }
+
+    private static func debugUUID(_ value: Int) -> UUID {
+        UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", value)) ?? UUID()
     }
 
     private static func debugDate(year: Int, month: Int, day: Int, hour: Int) -> Date {
