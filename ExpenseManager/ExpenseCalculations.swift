@@ -36,6 +36,15 @@ enum ExpenseCalculations {
         let netAmount: Decimal
     }
 
+    struct MonthlyTargetProgress {
+        let spentAmount: Decimal
+        let targetAmount: Decimal
+
+        var budget: BudgetCalculation {
+            BudgetCalculation(spentAmount: spentAmount, targetAmount: targetAmount)
+        }
+    }
+
     static func netExpenseAmount(amount: Decimal, refundedAmount: Decimal) -> Decimal {
         let sanitizedAmount = max(amount, 0)
         let sanitizedRefund = min(max(refundedAmount, 0), sanitizedAmount)
@@ -69,6 +78,42 @@ enum ExpenseCalculations {
         }
 
         return netExpenseTotal(monthlyAmounts)
+    }
+
+    static func monthlyTargetProgress(
+        for entries: [DatedNetAmount],
+        categoryTargets: [String: Decimal],
+        month: Date,
+        calendar: Calendar = .current
+    ) -> MonthlyTargetProgress? {
+        let positiveTargets = categoryTargets.filter { $0.value > 0 }
+        let targetAmount = positiveTargets.values.reduce(Decimal(0), +)
+
+        guard targetAmount > 0 else {
+            return nil
+        }
+
+        let spentAmount = positiveTargets.keys.reduce(Decimal(0)) { total, categoryId in
+            total + monthlyNetExpenseTotal(
+                for: entries,
+                categoryId: categoryId,
+                month: month,
+                calendar: calendar
+            )
+        }
+
+        return MonthlyTargetProgress(spentAmount: spentAmount, targetAmount: targetAmount)
+    }
+
+    static func requiresHistoricalExchangeRate(
+        expenseDate: Date,
+        sourceCurrencyCode: String,
+        primaryCurrencyCode: String,
+        referenceDate: Date = Date(),
+        calendar: Calendar = .current
+    ) -> Bool {
+        sourceCurrencyCode != primaryCurrencyCode
+            && !calendar.isDate(expenseDate, inSameDayAs: referenceDate)
     }
 
     static func budget(spentAmount: Decimal, targetAmount: Decimal?) -> BudgetCalculation? {

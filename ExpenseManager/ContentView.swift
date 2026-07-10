@@ -920,17 +920,33 @@ struct ContentView: View {
     }
 
     private var currentMonthExpenseTotal: Decimal {
-        let calendar = Calendar.current
-        let currentMonthExpenses = expenses.filter { calendar.isDate($0.date, equalTo: Date(), toGranularity: .month) }
-        return netExpenseTotalByCategory(for: currentMonthExpenses)
+        ExpenseCalculations.monthlyNetExpenseTotal(for: expenseCalculationEntries, month: Date())
     }
 
-    private var monthlyExpenseGoal: Decimal? {
-        let target = categories.reduce(Decimal(0)) { total, category in
-            total + (category.monthlyTarget ?? 0)
+    private var expenseCalculationEntries: [ExpenseCalculations.DatedNetAmount] {
+        expenses.map { expense in
+            ExpenseCalculations.DatedNetAmount(
+                categoryId: expense.categoryId,
+                date: expense.date,
+                netAmount: expense.netAmount
+            )
         }
+    }
 
-        return target > 0 ? target : nil
+    private var monthlyTargetProgress: ExpenseCalculations.MonthlyTargetProgress? {
+        let targets = Dictionary(uniqueKeysWithValues: categories.compactMap { category -> (String, Decimal)? in
+            guard let monthlyTarget = category.monthlyTarget, monthlyTarget > 0 else {
+                return nil
+            }
+
+            return (category.id, monthlyTarget)
+        })
+
+        return ExpenseCalculations.monthlyTargetProgress(
+            for: expenseCalculationEntries,
+            categoryTargets: targets,
+            month: Date()
+        )
     }
 
     private var monthlyExpenseSummaryText: String {
@@ -938,10 +954,26 @@ struct ContentView: View {
             return appLanguage.text(he: "אין הוצאות עדיין", en: "No expenses yet")
         }
 
-        return appLanguage.text(
+        let spentText = appLanguage.text(
             he: "הוצאת החודש \(currentMonthExpenseTotal.formattedShekelAmount)",
             en: "Spent this month \(currentMonthExpenseTotal.formattedShekelAmount)"
         )
+
+        guard let monthlyTargetProgress else {
+            return spentText
+        }
+
+        let budget = monthlyTargetProgress.budget
+        let usedPercentage = budget.usedPercentage ?? 0
+        let targetLine = appLanguage.text(
+            he: "יעדים: \(monthlyTargetProgress.spentAmount.formattedShekelAmount) / \(monthlyTargetProgress.targetAmount.formattedShekelAmount) (\(usedPercentage.formattedPercentText))",
+            en: "Targets: \(monthlyTargetProgress.spentAmount.formattedShekelAmount) / \(monthlyTargetProgress.targetAmount.formattedShekelAmount) (\(usedPercentage.formattedPercentText))"
+        )
+        let statusLine = budget.overBudgetAmount > 0
+            ? appLanguage.text(he: "חריגה: \(budget.overBudgetAmount.formattedShekelAmount)", en: "Over by \(budget.overBudgetAmount.formattedShekelAmount)")
+            : appLanguage.text(he: "נשאר: \(budget.remainingAmount.formattedShekelAmount)", en: "Left: \(budget.remainingAmount.formattedShekelAmount)")
+
+        return "\(spentText)\n\(targetLine) · \(statusLine)"
     }
 
     private var selectedCategoryTargetStatus: CategoryMonthlyTargetStatus? {
@@ -1362,6 +1394,7 @@ struct ContentView: View {
     private func saveBackfillExpenses(
         mode: BackfillExpenseMode,
         amount: Decimal,
+        selectedCurrency: CurrencyOption,
         month: Date,
         monthCount: Int,
         existingCategoryId: String?,
@@ -1381,32 +1414,69 @@ struct ContentView: View {
         let calendar = Calendar.current
         let safeMonthCount = max(monthCount, 1)
         let cleanExpenseName = trimmedExpenseName.isEmpty ? nil : trimmedExpenseName
+        let expenseDates: [Date]
 
         switch mode {
         case .oneTime:
+            expenseDates = [month]
+        case .recurring:
+            expenseDates = (0..<safeMonthCount).compactMap { offset in
+                calendar.date(byAdding: .month, value: -offset, to: month)
+            }
+        }
+
+        if expenseDates.contains(where: {
+            ExpenseCalculations.requiresHistoricalExchangeRate(
+                expenseDate: $0,
+                sourceCurrencyCode: selectedCurrency.code,
+                primaryCurrencyCode: currency.code
+            )
+        }) {
+            return appLanguage.text(
+                he: "לא ניתן להוסיף הוצאה בדיעבד במטבע זר בלי שער היסטורי לתאריך ההוצאה",
+                en: "Past foreign-currency expenses require a historical exchange rate for the expense date"
+            )
+        }
+
+        guard let conversion = CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: currency) else {
+            return currencyConversionUnavailableMessage
+        }
+
+        switch mode {
+        case .oneTime:
+            let exchangeRateDate = selectedCurrency == currency ? month : conversion.exchangeRateDate
             expenses.append(Expense(
                 categoryId: category.id,
                 categoryName: category.name,
-                amount: amount,
+                amount: conversion.convertedAmount,
                 createdAt: Date(),
                 date: month,
                 name: cleanExpenseName,
-                source: .backfill
+                source: .backfill,
+                originalAmount: amount,
+                originalCurrencyCode: selectedCurrency.code,
+                exchangeRate: conversion.exchangeRate,
+                exchangeRateDate: exchangeRateDate,
+                convertedAmount: conversion.convertedAmount,
+                convertedCurrencyCode: currency.code
             ))
         case .recurring:
-            for offset in 0..<safeMonthCount {
-                guard let expenseDate = calendar.date(byAdding: .month, value: -offset, to: month) else {
-                    continue
-                }
-
+            for expenseDate in expenseDates {
+                let exchangeRateDate = selectedCurrency == currency ? expenseDate : conversion.exchangeRateDate
                 expenses.append(Expense(
                     categoryId: category.id,
                     categoryName: category.name,
-                    amount: amount,
+                    amount: conversion.convertedAmount,
                     createdAt: Date(),
                     date: expenseDate,
                     name: cleanExpenseName,
-                    source: .backfill
+                    source: .backfill,
+                    originalAmount: amount,
+                    originalCurrencyCode: selectedCurrency.code,
+                    exchangeRate: conversion.exchangeRate,
+                    exchangeRateDate: exchangeRateDate,
+                    convertedAmount: conversion.convertedAmount,
+                    convertedCurrencyCode: currency.code
                 ))
             }
         }
@@ -8988,6 +9058,8 @@ private struct EditExpenseView: View {
     @State private var refundMode: ExpenseRefundEditMode
     @State private var refundedAmountText: String
     @State private var selectedCategoryId: String?
+    @State private var selectedCurrency: CurrencyOption
+    @State private var isCurrencyPickerPresented = false
     @State private var errorMessage: String?
 
     init(
@@ -9003,7 +9075,9 @@ private struct EditExpenseView: View {
         self.onSave = onSave
         self.onCancel = onCancel
         _name = State(initialValue: expense.name ?? "")
-        _amountText = State(initialValue: expense.amount.plainString)
+        let primaryCurrency = Storage.loadCurrency()
+        let originalCurrency = CurrencyOption.option(for: expense.originalCurrencyCode) ?? primaryCurrency
+        _amountText = State(initialValue: expense.originalAmount.plainString)
         _date = State(initialValue: expense.date)
         _refundMode = State(initialValue: {
             switch expense.refundStatus {
@@ -9017,6 +9091,7 @@ private struct EditExpenseView: View {
         }())
         _refundedAmountText = State(initialValue: expense.refundedAmount > 0 ? expense.refundedAmount.plainString : "")
         _selectedCategoryId = State(initialValue: expense.categoryId)
+        _selectedCurrency = State(initialValue: originalCurrency)
     }
 
     private var parsedAmount: Decimal? {
@@ -9027,8 +9102,24 @@ private struct EditExpenseView: View {
         Decimal(string: refundedAmountText, locale: Locale(identifier: "en_US_POSIX"))
     }
 
+    private var primaryCurrency: CurrencyOption {
+        Storage.loadCurrency()
+    }
+
+    private var conversion: CurrencyConversionResult? {
+        guard let parsedAmount, selectedCurrency != primaryCurrency else {
+            return nil
+        }
+
+        return CurrencyExchangeService.convert(amount: parsedAmount, from: selectedCurrency, to: primaryCurrency)
+    }
+
     private var convertedAmount: Decimal {
-        parsedAmount ?? 0
+        guard let parsedAmount else {
+            return 0
+        }
+
+        return selectedCurrency == primaryCurrency ? parsedAmount : (conversion?.convertedAmount ?? parsedAmount)
     }
 
     private var effectiveRefundedAmount: Decimal {
@@ -9096,7 +9187,14 @@ private struct EditExpenseView: View {
                 .padding(.horizontal, 14)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
 
-            AmountInputField(amountText: $amountText)
+            AmountInputField(
+                amountText: $amountText,
+                selectedCurrency: $selectedCurrency,
+                onCurrencyButtonTapped: { isCurrencyPickerPresented = true }
+            )
+            .onChange(of: selectedCurrency) {
+                errorMessage = nil
+            }
 
             VStack(alignment: appLanguage.horizontalAlignment, spacing: 8) {
                 Text(appLanguage.text(he: "החזר", en: "Refund"))
@@ -9215,12 +9313,55 @@ private struct EditExpenseView: View {
                         return
                     }
 
+                    if selectedCurrency != primaryCurrency {
+                        guard !ExpenseCalculations.requiresHistoricalExchangeRate(
+                            expenseDate: date,
+                            sourceCurrencyCode: selectedCurrency.code,
+                            primaryCurrencyCode: primaryCurrency.code
+                        ) else {
+                            errorMessage = appLanguage.text(
+                                he: "לא ניתן לשמור הוצאה בדיעבד במטבע זר בלי שער היסטורי לתאריך ההוצאה",
+                                en: "Past foreign-currency expenses require a historical exchange rate for the expense date"
+                            )
+                            return
+                        }
+
+                        guard let conversion else {
+                            errorMessage = appLanguage.text(
+                                he: "לא ניתן להמיר את המטבע שנבחר",
+                                en: "Could not convert the selected currency"
+                            )
+                            return
+                        }
+
+                        onSave(expense.updated(
+                            category: category,
+                            amount: conversion.convertedAmount,
+                            refundedAmount: refundedAmount,
+                            date: date,
+                            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                            originalAmount: amount,
+                            originalCurrencyCode: selectedCurrency.code,
+                            exchangeRate: conversion.exchangeRate,
+                            exchangeRateDate: conversion.exchangeRateDate,
+                            convertedAmount: conversion.convertedAmount,
+                            convertedCurrencyCode: primaryCurrency.code
+                        ))
+                        return
+                    }
+
                     onSave(expense.updated(
                         category: category,
                         amount: amount,
                         refundedAmount: refundedAmount,
                         date: date,
-                        name: name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                        originalAmount: amount,
+                        originalCurrencyCode: primaryCurrency.code,
+                        exchangeRate: 1,
+                        exchangeRateDate: date,
+                        convertedAmount: amount,
+                        convertedCurrencyCode: primaryCurrency.code
                     ))
                 }
                 .buttonStyle(.borderedProminent)
@@ -9231,6 +9372,17 @@ private struct EditExpenseView: View {
         .padding(20)
         .environment(\.layoutDirection, appLanguage.layoutDirection)
         .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
+        .confirmationDialog(
+            appLanguage.text(he: "בחר מטבע", en: "Choose Currency"),
+            isPresented: $isCurrencyPickerPresented,
+            titleVisibility: .visible
+        ) {
+            ForEach(CurrencyOption.allCases) { currency in
+                Button(currency.selectorTitle) {
+                    selectedCurrency = currency
+                }
+            }
+        }
     }
 
     private var selectedCategoryBinding: Binding<String?> {
@@ -9254,6 +9406,8 @@ private struct HistoricalExpenseEditorView: View {
     @State private var amountText = ""
     @State private var date: Date
     @State private var selectedCategoryId: String?
+    @State private var selectedCurrency = Storage.loadCurrency()
+    @State private var isCurrencyPickerPresented = false
     @State private var errorMessage: String?
 
     init(
@@ -9310,8 +9464,15 @@ private struct HistoricalExpenseEditorView: View {
                 .padding(.horizontal, 14)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
 
-            AmountInputField(amountText: $amountText)
+            AmountInputField(
+                amountText: $amountText,
+                selectedCurrency: $selectedCurrency,
+                onCurrencyButtonTapped: { isCurrencyPickerPresented = true }
+            )
                 .onChange(of: amountText) {
+                    errorMessage = nil
+                }
+                .onChange(of: selectedCurrency) {
                     errorMessage = nil
                 }
 
@@ -9350,6 +9511,47 @@ private struct HistoricalExpenseEditorView: View {
                     }
 
                     let expenseDate = allowsDateTimeSelection ? date : Calendar.current.normalizedMonthDate(for: selectedMonth)
+                    let primaryCurrency = Storage.loadCurrency()
+
+                    if selectedCurrency != primaryCurrency {
+                        guard !ExpenseCalculations.requiresHistoricalExchangeRate(
+                            expenseDate: expenseDate,
+                            sourceCurrencyCode: selectedCurrency.code,
+                            primaryCurrencyCode: primaryCurrency.code
+                        ) else {
+                            errorMessage = appLanguage.text(
+                                he: "לא ניתן להוסיף הוצאה בדיעבד במטבע זר בלי שער היסטורי לתאריך ההוצאה",
+                                en: "Past foreign-currency expenses require a historical exchange rate for the expense date"
+                            )
+                            return
+                        }
+
+                        guard let conversion = CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: primaryCurrency) else {
+                            errorMessage = appLanguage.text(
+                                he: "לא ניתן להמיר את המטבע שנבחר",
+                                en: "Could not convert the selected currency"
+                            )
+                            return
+                        }
+
+                        onSave(Expense(
+                            categoryId: category.id,
+                            categoryName: category.name,
+                            amount: conversion.convertedAmount,
+                            createdAt: Date(),
+                            date: expenseDate,
+                            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                            source: .backfill,
+                            originalAmount: amount,
+                            originalCurrencyCode: selectedCurrency.code,
+                            exchangeRate: conversion.exchangeRate,
+                            exchangeRateDate: conversion.exchangeRateDate,
+                            convertedAmount: conversion.convertedAmount,
+                            convertedCurrencyCode: primaryCurrency.code
+                        ))
+                        return
+                    }
+
                     onSave(Expense(
                         categoryId: category.id,
                         categoryName: category.name,
@@ -9357,7 +9559,13 @@ private struct HistoricalExpenseEditorView: View {
                         createdAt: Date(),
                         date: expenseDate,
                         name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-                        source: .backfill
+                        source: .backfill,
+                        originalAmount: amount,
+                        originalCurrencyCode: primaryCurrency.code,
+                        exchangeRate: 1,
+                        exchangeRateDate: expenseDate,
+                        convertedAmount: amount,
+                        convertedCurrencyCode: primaryCurrency.code
                     ))
                 }
                 .buttonStyle(.borderedProminent)
@@ -9368,6 +9576,17 @@ private struct HistoricalExpenseEditorView: View {
         .padding(20)
         .environment(\.layoutDirection, appLanguage.layoutDirection)
         .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
+        .confirmationDialog(
+            appLanguage.text(he: "בחר מטבע", en: "Choose Currency"),
+            isPresented: $isCurrencyPickerPresented,
+            titleVisibility: .visible
+        ) {
+            ForEach(CurrencyOption.allCases) { currency in
+                Button(currency.selectorTitle) {
+                    selectedCurrency = currency
+                }
+            }
+        }
         .onAppear {
             selectedCategoryId = categories.first?.id
         }
@@ -10255,12 +10474,13 @@ private struct BackfillExpenseView: View {
     @Environment(\.appLanguage) private var appLanguage
 
     let categories: [ExpenseCategory]
-    let onSave: (BackfillExpenseMode, Decimal, Date, Int, String?, String?, String) -> String?
+    let onSave: (BackfillExpenseMode, Decimal, CurrencyOption, Date, Int, String?, String?, String) -> String?
     let onClose: () -> Void
 
     @State private var mode: BackfillExpenseMode = .oneTime
     @State private var expenseName = ""
     @State private var amountText = ""
+    @State private var selectedCurrency = Storage.loadCurrency()
     @State private var selectedMonth = Date()
     @State private var monthCount = 1
     @State private var categoryMode: RecurringCategoryMode = .existing
@@ -10298,7 +10518,7 @@ private struct BackfillExpenseView: View {
                     TextField(appLanguage.text(he: "שם ההוצאה", en: "Expense name"), text: $expenseName)
                         .keyboardType(.default)
                         .textInputAutocapitalization(.never)
-                .localizedTextInput(appLanguage)
+                        .localizedTextInput(appLanguage)
                         .onChange(of: expenseName) {
                             errorMessage = nil
                         }
@@ -10307,6 +10527,25 @@ private struct BackfillExpenseView: View {
                         .onChange(of: amountText) {
                             errorMessage = nil
                         }
+
+                    Picker(appLanguage.text(he: "מטבע", en: "Currency"), selection: $selectedCurrency) {
+                        ForEach(CurrencyOption.allCases) { currency in
+                            Text(currency.selectorTitle).tag(currency)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .onChange(of: selectedCurrency) {
+                        errorMessage = nil
+                    }
+
+                    if selectedCurrency != Storage.loadCurrency() {
+                        Text(appLanguage.text(
+                            he: "מטבע זר בדיעבד יישמר רק כשיש שער היסטורי לתאריך ההוצאה.",
+                            en: "Past foreign-currency expenses require a historical rate for the expense date."
+                        ))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    }
 
                     MonthNavigationView(selectedMonth: $selectedMonth)
 
@@ -10324,20 +10563,20 @@ private struct BackfillExpenseView: View {
                     }
                     .pickerStyle(.segmented)
 
-            if categoryMode == .existing, !categories.isEmpty {
-                Picker(appLanguage.text(he: "קטגוריה", en: "Category"), selection: selectedCategoryBinding) {
-                    ForEach(categories) { category in
-                        Text(category.displayName(for: appLanguage)).tag(Optional(category.id))
-                    }
+                    if categoryMode == .existing, !categories.isEmpty {
+                        Picker(appLanguage.text(he: "קטגוריה", en: "Category"), selection: selectedCategoryBinding) {
+                            ForEach(categories) { category in
+                                Text(category.displayName(for: appLanguage)).tag(Optional(category.id))
+                            }
                         }
-            } else {
-                TextField(appLanguage.text(he: "שם קטגוריה חדשה", en: "New category name"), text: $newCategoryName)
-                    .keyboardType(.default)
-                    .textInputAutocapitalization(.never)
-                .localizedTextInput(appLanguage)
-                    .onChange(of: newCategoryName) {
-                        errorMessage = nil
-                    }
+                    } else {
+                        TextField(appLanguage.text(he: "שם קטגוריה חדשה", en: "New category name"), text: $newCategoryName)
+                            .keyboardType(.default)
+                            .textInputAutocapitalization(.never)
+                            .localizedTextInput(appLanguage)
+                            .onChange(of: newCategoryName) {
+                                errorMessage = nil
+                            }
                     }
                 }
 
@@ -10405,6 +10644,7 @@ private struct BackfillExpenseView: View {
         errorMessage = onSave(
             mode,
             amount,
+            selectedCurrency,
             Calendar.current.normalizedMonthDate(for: selectedMonth),
             mode == .recurring ? monthCount : 1,
             categoryMode == .existing ? selectedCategoryId : nil,
@@ -12430,20 +12670,20 @@ private struct CategoryMonthlyTargetStatus {
     let targetAmount: Decimal
     let spentAmount: Decimal
 
+    private var budget: BudgetCalculation {
+        BudgetCalculation(spentAmount: spentAmount, targetAmount: targetAmount)
+    }
+
     var remainingAmount: Decimal {
-        max(targetAmount - spentAmount, 0)
+        budget.remainingAmount
     }
 
     var overBudgetAmount: Decimal {
-        max(spentAmount - targetAmount, 0)
+        budget.overBudgetAmount
     }
 
     var overBudgetPercentage: Decimal? {
-        guard targetAmount > 0, overBudgetAmount > 0 else {
-            return nil
-        }
-
-        return overBudgetAmount / targetAmount * 100
+        budget.overBudgetPercentage
     }
 
     var isOverBudget: Bool {
@@ -13487,10 +13727,14 @@ private struct Expense: Identifiable, Codable {
         amount: Decimal,
         refundedAmount: Decimal,
         date: Date,
-        name: String
+        name: String,
+        originalAmount: Decimal,
+        originalCurrencyCode: String,
+        exchangeRate: Decimal,
+        exchangeRateDate: Date,
+        convertedAmount: Decimal,
+        convertedCurrencyCode: String
     ) -> Expense {
-        let primaryCurrency = Storage.loadCurrency()
-
         return Expense(
             id: id,
             categoryId: category.id,
@@ -13503,12 +13747,12 @@ private struct Expense: Identifiable, Codable {
             name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : name,
             isRecurring: isRecurring,
             source: source,
-            originalAmount: amount,
-            originalCurrencyCode: primaryCurrency.code,
-            exchangeRate: 1,
-            exchangeRateDate: Date(),
-            convertedAmount: amount,
-            convertedCurrencyCode: primaryCurrency.code
+            originalAmount: originalAmount,
+            originalCurrencyCode: originalCurrencyCode,
+            exchangeRate: exchangeRate,
+            exchangeRateDate: exchangeRateDate,
+            convertedAmount: convertedAmount,
+            convertedCurrencyCode: convertedCurrencyCode
         )
     }
 
@@ -13700,6 +13944,50 @@ private struct RestoreSnapshot: Identifiable, Codable {
         )
     }
 }
+
+#if DEBUG
+func debugRestoreSnapshotPreservesSavingModelsForTests() -> Bool {
+    let goal = SavingGoal(
+        name: "Unit Test Goal",
+        targetAmount: 1000,
+        location: .bank,
+        createdAt: Date(timeIntervalSince1970: 1)
+    )
+    let recurringSaving = RecurringSaving(
+        amount: 100,
+        goalId: goal.id,
+        startDate: Date(timeIntervalSince1970: 2),
+        createdAt: Date(timeIntervalSince1970: 2)
+    )
+    let snapshot = RestoreSnapshot(
+        createdAt: Date(timeIntervalSince1970: 3),
+        expenses: [],
+        recurringExpenses: [],
+        savings: [],
+        savingGoals: [goal],
+        recurringSavings: [recurringSaving],
+        debts: [],
+        salaryEntries: [],
+        categories: [],
+        deletedCategoryBuckets: [],
+        userName: "QA",
+        currency: .ils,
+        appLanguage: .en,
+        salaryReceiptDay: 1,
+        checkingBalance: nil,
+        savingsGoal: nil
+    )
+
+    guard let data = try? JSONEncoder().encode(snapshot),
+          let decoded = try? JSONDecoder().decode(RestoreSnapshot.self, from: data) else {
+        return false
+    }
+
+    return decoded.savingGoals.map(\.id) == [goal.id]
+        && decoded.recurringSavings.map(\.id) == [recurringSaving.id]
+        && decoded.recurringSavings.first?.goalId == goal.id
+}
+#endif
 
 private enum Storage {
     private static let expensesKey = "expenses"
@@ -14146,6 +14434,9 @@ private enum Storage {
     private static let debugSavingWithdrawalID = UUID(uuidString: "00000000-0000-0000-0000-00000000B003")!
     private static let debugSalaryEntryID = UUID(uuidString: "00000000-0000-0000-0000-00000000C001")!
     private static let debugIOweDebtID = UUID(uuidString: "00000000-0000-0000-0000-00000000D003")!
+    private static let debugRecurringSavingID = UUID(uuidString: "00000000-0000-0000-0000-00000000B004")!
+    private static let debugForeignCurrentExpenseID = UUID(uuidString: "00000000-0000-0000-0000-00000000A003")!
+    private static let debugForeignPastExpenseID = UUID(uuidString: "00000000-0000-0000-0000-00000000A004")!
 
     static func createDebugQATestData() {
         clearDebugQATestData()
@@ -14157,6 +14448,8 @@ private enum Storage {
         let withdrawalDate = debugDate(year: 2026, month: 7, day: 11, hour: 13)
         let salaryDate = debugDate(year: 2026, month: 7, day: 1, hour: 9)
         let futureExpenseDate = debugDate(year: 2026, month: 8, day: 3, hour: 10)
+        let foreignCurrentDate = debugDate(year: 2026, month: 7, day: 10, hour: 14)
+        let foreignPastDate = debugDate(year: 2026, month: 6, day: 15, hour: 14)
 
         var categories = loadCategories(defaults: ExpenseCategory.placeholderCategories)
         categories = categories.map { category in
@@ -14246,6 +14539,36 @@ private enum Storage {
                 createdAt: futureExpenseDate,
                 date: futureExpenseDate,
                 name: "QA Future Expense Must Not Affect July"
+            ),
+            Expense(
+                id: debugForeignCurrentExpenseID,
+                categoryId: "food",
+                categoryName: "אוכל",
+                amount: 35,
+                createdAt: foreignCurrentDate,
+                date: foreignCurrentDate,
+                name: "QA Foreign Current USD",
+                originalAmount: 10,
+                originalCurrencyCode: CurrencyOption.usd.code,
+                exchangeRate: 3.5,
+                exchangeRateDate: foreignCurrentDate,
+                convertedAmount: 35,
+                convertedCurrencyCode: CurrencyOption.ils.code
+            ),
+            Expense(
+                id: debugForeignPastExpenseID,
+                categoryId: "qa-below-target",
+                categoryName: "QA Below Target",
+                amount: 80,
+                createdAt: foreignPastDate,
+                date: foreignPastDate,
+                name: "QA Foreign Past EUR",
+                originalAmount: 20,
+                originalCurrencyCode: CurrencyOption.eur.code,
+                exchangeRate: 4,
+                exchangeRateDate: foreignPastDate,
+                convertedAmount: 80,
+                convertedCurrencyCode: CurrencyOption.ils.code
             )
         ])
         for month in 1...12 {
@@ -14335,6 +14658,16 @@ private enum Storage {
         ])
         saveSavings(savings.sorted { $0.date > $1.date })
 
+        var recurringSavings = loadRecurringSavings()
+        recurringSavings.append(RecurringSaving(
+            id: debugRecurringSavingID,
+            amount: 75,
+            goalId: debugSavingGoalID,
+            startDate: savingDate,
+            createdAt: savingDate
+        ))
+        saveRecurringSavings(recurringSavings.sorted { $0.startDate > $1.startDate })
+
         var salaryEntries = loadSalaryEntries()
         salaryEntries.append(SalaryEntry(
             id: debugSalaryEntryID,
@@ -14348,7 +14681,7 @@ private enum Storage {
 
     static func clearDebugQATestData() {
         saveExpenses(loadExpenses().filter { expense in
-            ![debugFoodExpenseID, debugShoppingExpenseID].contains(expense.id)
+            ![debugFoodExpenseID, debugShoppingExpenseID, debugForeignCurrentExpenseID, debugForeignPastExpenseID].contains(expense.id)
                 && !(expense.name ?? "").hasPrefix("QA ")
         })
         saveDebts(loadDebts().filter { debt in
@@ -14360,6 +14693,7 @@ private enum Storage {
         })
         saveCategories(loadCategories(defaults: ExpenseCategory.placeholderCategories).filter { !$0.id.hasPrefix("qa-") })
         saveSavings(loadSavings().filter { ![debugSavingDepositID, debugSavingWithdrawalID].contains($0.id) })
+        saveRecurringSavings(loadRecurringSavings().filter { $0.id != debugRecurringSavingID })
         saveSalaryEntries(loadSalaryEntries().filter { $0.id != debugSalaryEntryID })
     }
 
