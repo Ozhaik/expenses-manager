@@ -66,23 +66,50 @@ private func categoryTargetStatusLineText(_ status: CategoryMonthlyTargetStatus,
     )
 }
 
-private func categoryTargetMainProgressText(_ status: CategoryMonthlyTargetStatus, language: AppLanguage) -> String {
-    let usedPercentage = status.targetAmount > 0 ? status.spentAmount / status.targetAmount * 100 : 0
-    let progressText = "\(status.spentAmount.mainTargetAmountText(for: language))/\(status.targetAmount.mainTargetAmountText(for: language)) (\(usedPercentage.formattedPercentText))"
-    return language == .he ? "\u{200E}\(progressText)\u{200E}" : progressText
+private func leftToRightNumberSegment(_ text: String, language: AppLanguage) -> String {
+    language == .he ? "\u{2066}\(text)\u{2069}" : text
 }
 
-private func categoryTargetMainRemainingText(_ status: CategoryMonthlyTargetStatus, language: AppLanguage) -> String {
-    if status.isOverBudget {
-        return language.text(
-            he: "חריגה של \(status.overBudgetAmount.formattedShekelAmount)",
-            en: "Over by \(status.overBudgetAmount.formattedShekelAmount)"
-        )
+private func compactCurrencyAmountText(_ amount: Decimal, language: AppLanguage) -> String {
+    let symbol = Storage.loadCurrency().symbol
+    return language == .he ? "\(amount.plainString)\(symbol)" : "\(symbol)\(amount.plainString)"
+}
+
+private func compactAmountText(_ amount: Decimal) -> String {
+    amount.plainString
+}
+
+private func compactTargetRatioText(spentAmount: Decimal, targetAmount: Decimal, language: AppLanguage) -> String {
+    if language == .he {
+        return "\(compactAmountText(spentAmount))/\(compactAmountText(targetAmount))"
     }
 
+    return "\(compactCurrencyAmountText(spentAmount, language: language))/\(compactCurrencyAmountText(targetAmount, language: language))"
+}
+
+private func compactTargetPercentText(spentAmount: Decimal, targetAmount: Decimal) -> String {
+    let usedPercentage = targetAmount > 0 ? spentAmount / targetAmount * 100 : 0
+    return "(\(usedPercentage.formattedPercentText))"
+}
+
+private func categoryTargetMainProgressText(_ status: CategoryMonthlyTargetStatus, language: AppLanguage) -> String {
+    let progressText = "\(compactTargetRatioText(spentAmount: status.spentAmount, targetAmount: status.targetAmount, language: language)) \(compactTargetPercentText(spentAmount: status.spentAmount, targetAmount: status.targetAmount))"
+    return leftToRightNumberSegment(progressText, language: language)
+}
+
+private func categoryTargetMainSentenceText(_ status: CategoryMonthlyTargetStatus, categoryName: String, language: AppLanguage) -> String {
+    let progressText = categoryTargetMainProgressText(status, language: language)
     return language.text(
-        he: "נשאר: \(status.remainingAmount.formattedShekelAmount)",
-        en: "Left: \(status.remainingAmount.formattedShekelAmount)"
+        he: "הוצאת \(progressText) על \(categoryName)",
+        en: "Spent \(progressText) on \(categoryName)"
+    )
+}
+
+private func categoryNoTargetMainSentenceText(spentAmount: Decimal, categoryName: String, language: AppLanguage) -> String {
+    let spentText = leftToRightNumberSegment(compactCurrencyAmountText(spentAmount, language: language), language: language)
+    return language.text(
+        he: "הוצאת \(spentText) על \(categoryName)",
+        en: "Spent \(spentText) on \(categoryName)"
     )
 }
 
@@ -97,6 +124,36 @@ private func isValidSetupUserName(_ name: String) -> Bool {
     }
 
     return !["qa", "user", "משתמש"].contains(normalizedName)
+}
+
+private struct FixedHebrewVisualText: View {
+    let parts: [String]
+    let accessibilityLabel: String
+    let fontSize: CGFloat
+    let minimumScaleFactor: CGFloat
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
+                Text(part)
+                    .environment(\.layoutDirection, containsHebrew(part) ? .rightToLeft : .leftToRight)
+            }
+        }
+        .environment(\.layoutDirection, .leftToRight)
+        .font(.system(size: fontSize, weight: .semibold))
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .minimumScaleFactor(minimumScaleFactor)
+        .multilineTextAlignment(.center)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private func containsHebrew(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            (0x0590...0x05FF).contains(Int(scalar.value))
+        }
+    }
 }
 
 
@@ -554,19 +611,15 @@ struct ContentView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.78)
 
-                Text(monthlyExpenseSummaryText)
+                monthlyExpenseSummaryView
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .lineLimit(2)
-
-                Text(categoryPositionText)
-                    .font(.footnote.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 58)
-            .padding(.bottom, 12)
+            .padding(.bottom, 24)
 
             HStack(spacing: 8) {
                 categoryNavigationButton(
@@ -581,6 +634,7 @@ struct ContentView: View {
                         CategoryCard(
                             category: selectedCategory,
                             isSelected: true,
+                            positionText: categoryPositionText,
                             monthlyTotal: monthlyTotal(for: selectedCategory),
                             monthlyTargetStatus: selectedCategoryTargetStatus,
                             onAddTarget: {
@@ -601,7 +655,7 @@ struct ContentView: View {
                     }
                 }
                 .frame(maxWidth: .infinity)
-                .frame(height: 260)
+                .frame(height: 296)
                 .clipped()
 
                 categoryNavigationButton(
@@ -612,6 +666,7 @@ struct ContentView: View {
                 }
             }
             .padding(.horizontal, 8)
+            .padding(.top, 8)
 
             CategoryPageDots(count: categories.count, currentIndex: currentCategoryIndex)
                 .padding(.top, 12)
@@ -949,31 +1004,51 @@ struct ContentView: View {
         )
     }
 
-    private var monthlyExpenseSummaryText: String {
+    @ViewBuilder
+    private var monthlyExpenseSummaryView: some View {
         if expenses.isEmpty && currentMonthExpenseTotal == 0 {
-            return appLanguage.text(he: "אין הוצאות עדיין", en: "No expenses yet")
+            Text(appLanguage.text(he: "אין הוצאות עדיין", en: "No expenses yet"))
+        } else if let monthlyTargetProgress {
+            let ratioText = compactTargetRatioText(
+                spentAmount: monthlyTargetProgress.spentAmount,
+                targetAmount: monthlyTargetProgress.targetAmount,
+                language: appLanguage
+            )
+            let percentText = compactTargetPercentText(
+                spentAmount: monthlyTargetProgress.spentAmount,
+                targetAmount: monthlyTargetProgress.targetAmount
+            )
+
+            if appLanguage == .he {
+                FixedHebrewVisualText(
+                    parts: ["הוצאת החודש", ratioText, percentText],
+                    accessibilityLabel: "הוצאת החודש \(ratioText) \(percentText)",
+                    fontSize: 15,
+                    minimumScaleFactor: 0.78
+                )
+                .frame(height: 18)
+                .fixedSize(horizontal: true, vertical: false)
+            } else {
+                Text("Spent this month \(ratioText) \(percentText)")
+            }
+        } else {
+            let spentText = appLanguage == .he
+                ? compactAmountText(currentMonthExpenseTotal)
+                : compactCurrencyAmountText(currentMonthExpenseTotal, language: appLanguage)
+
+            if appLanguage == .he {
+                FixedHebrewVisualText(
+                    parts: ["הוצאת החודש", spentText],
+                    accessibilityLabel: "הוצאת החודש \(spentText)",
+                    fontSize: 15,
+                    minimumScaleFactor: 0.78
+                )
+                .frame(height: 18)
+                .fixedSize(horizontal: true, vertical: false)
+            } else {
+                Text("Spent this month \(spentText)")
+            }
         }
-
-        let spentText = appLanguage.text(
-            he: "הוצאת החודש \(currentMonthExpenseTotal.formattedShekelAmount)",
-            en: "Spent this month \(currentMonthExpenseTotal.formattedShekelAmount)"
-        )
-
-        guard let monthlyTargetProgress else {
-            return spentText
-        }
-
-        let budget = monthlyTargetProgress.budget
-        let usedPercentage = budget.usedPercentage ?? 0
-        let targetLine = appLanguage.text(
-            he: "יעדים: \(monthlyTargetProgress.spentAmount.formattedShekelAmount) / \(monthlyTargetProgress.targetAmount.formattedShekelAmount) (\(usedPercentage.formattedPercentText))",
-            en: "Targets: \(monthlyTargetProgress.spentAmount.formattedShekelAmount) / \(monthlyTargetProgress.targetAmount.formattedShekelAmount) (\(usedPercentage.formattedPercentText))"
-        )
-        let statusLine = budget.overBudgetAmount > 0
-            ? appLanguage.text(he: "חריגה: \(budget.overBudgetAmount.formattedShekelAmount)", en: "Over by \(budget.overBudgetAmount.formattedShekelAmount)")
-            : appLanguage.text(he: "נשאר: \(budget.remainingAmount.formattedShekelAmount)", en: "Left: \(budget.remainingAmount.formattedShekelAmount)")
-
-        return "\(spentText)\n\(targetLine) · \(statusLine)"
     }
 
     private var selectedCategoryTargetStatus: CategoryMonthlyTargetStatus? {
@@ -11604,53 +11679,49 @@ private struct CategoryCard: View {
 
     let category: ExpenseCategory
     let isSelected: Bool
+    let positionText: String
     let monthlyTotal: Decimal
     let monthlyTargetStatus: CategoryMonthlyTargetStatus?
     let onAddTarget: () -> Void
 
     var body: some View {
-        VStack(spacing: 12) {
-            VStack(spacing: 4) {
+        VStack(spacing: 10) {
+            VStack(spacing: 7) {
+                Text(positionText)
+                    .font(.footnote.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+
                 if let monthlyTargetStatus {
-                    Text(categoryTargetMainProgressText(monthlyTargetStatus, language: appLanguage))
+                    categoryTargetText(monthlyTargetStatus)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.7)
-
-                    Text(categoryTargetMainRemainingText(monthlyTargetStatus, language: appLanguage))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(monthlyTargetStatus.isOverBudget ? Color.red : .secondary)
-                        .multilineTextAlignment(.center)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
+                        .minimumScaleFactor(0.62)
                 } else {
-                    HStack(spacing: 5) {
-                        Text(appLanguage.text(he: "ללא יעד", en: "No target"))
-                            .foregroundStyle(.secondary)
-
-                        Text("·")
-                            .foregroundStyle(.secondary)
-
-                        Button {
-                            onAddTarget()
-                        } label: {
-                            Text(appLanguage.text(he: "הוסף יעד", en: "Add target"))
-                                .font(.caption.weight(.semibold))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Color.secondary.opacity(0.12), in: Capsule())
-                                .foregroundStyle(.primary)
-                        }
-                        .buttonStyle(.plain)
-                    }
+                    Text(appLanguage.text(he: "ללא יעד", en: "No Target"))
                     .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.78)
+                    .minimumScaleFactor(0.62)
                 }
+
+                Button {
+                    onAddTarget()
+                } label: {
+                    Text(monthlyTargetStatus == nil
+                        ? appLanguage.text(he: "הוסף יעד", en: "Add Target")
+                        : appLanguage.text(he: "שנה יעד", en: "Change Target"))
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 5)
+                        .background(Color.secondary.opacity(0.12), in: Capsule())
+                        .foregroundStyle(.primary)
+                }
+                .buttonStyle(.plain)
             }
-            .frame(width: 220, height: 42, alignment: .center)
+            .frame(width: 280, height: 72, alignment: .center)
 
             ZStack {
                 RoundedRectangle(cornerRadius: 8)
@@ -11669,6 +11740,33 @@ private struct CategoryCard: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(category.displayName(for: appLanguage))
         .accessibilityAddTraits(.isButton)
+    }
+
+    @ViewBuilder
+    private func categoryTargetText(_ status: CategoryMonthlyTargetStatus) -> some View {
+        let categoryName = category.displayName(for: appLanguage)
+        let ratioText = compactTargetRatioText(
+            spentAmount: status.spentAmount,
+            targetAmount: status.targetAmount,
+            language: appLanguage
+        )
+        let percentText = compactTargetPercentText(
+            spentAmount: status.spentAmount,
+            targetAmount: status.targetAmount
+        )
+
+        if appLanguage == .he {
+            FixedHebrewVisualText(
+                parts: ["על \(categoryName)", ratioText, percentText, "הוצאת"],
+                accessibilityLabel: "הוצאת \(ratioText) \(percentText) על \(categoryName)",
+                fontSize: 15,
+                minimumScaleFactor: 0.62
+            )
+            .frame(height: 18)
+            .fixedSize(horizontal: true, vertical: false)
+        } else {
+            Text("Spent \(ratioText) \(percentText) on \(categoryName)")
+        }
     }
 }
 
