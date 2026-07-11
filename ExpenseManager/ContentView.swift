@@ -92,6 +92,29 @@ private func compactTargetPercentText(spentAmount: Decimal, targetAmount: Decima
     return "(\(usedPercentage.formattedPercentText))"
 }
 
+private func currencyConversionUnavailableText(
+    amount: Decimal,
+    sourceCurrency: CurrencyOption,
+    targetCurrency: CurrencyOption,
+    language: AppLanguage
+) -> String {
+    if sourceCurrency == .thb && targetCurrency == .ils {
+        return language.text(
+            he: "לא ניתן להמיר \(amount.plainString) באט לשקלים כרגע כי שער ההמרה לבאט תאילנדי לא זמין.",
+            en: "Cannot convert \(amount.plainString) Thai baht to shekels right now because the Thai baht exchange rate is unavailable."
+        )
+    }
+
+    if let message = sourceCurrency.unsupportedExchangeRateMessage(for: language) {
+        return message
+    }
+
+    return language.text(
+        he: "לא ניתן להמיר מטבע כרגע. נסה שוב אחרי עדכון שערים.",
+        en: "Currency conversion is unavailable. Try again after rates update."
+    )
+}
+
 private func categoryTargetMainProgressText(_ status: CategoryMonthlyTargetStatus, language: AppLanguage) -> String {
     let progressText = "\(compactTargetRatioText(spentAmount: status.spentAmount, targetAmount: status.targetAmount, language: language)) \(compactTargetPercentText(spentAmount: status.spentAmount, targetAmount: status.targetAmount))"
     return leftToRightNumberSegment(progressText, language: language)
@@ -269,6 +292,15 @@ struct ContentView: View {
         appLanguage.text(
             he: "לא ניתן להמיר מטבע כרגע. נסה שוב אחרי עדכון שערים.",
             en: "Currency conversion is unavailable. Try again after rates update."
+        )
+    }
+
+    private func currencyConversionUnavailableMessage(amount: Decimal, sourceCurrency: CurrencyOption, targetCurrency: CurrencyOption) -> String {
+        currencyConversionUnavailableText(
+            amount: amount,
+            sourceCurrency: sourceCurrency,
+            targetCurrency: targetCurrency,
+            language: appLanguage
         )
     }
 
@@ -1099,7 +1131,11 @@ struct ContentView: View {
         }
 
         guard let conversion = CurrencyExchangeService.convert(amount: amount, from: mainSelectedCurrency, to: currency) else {
-            mainAlertMessage = currencyConversionUnavailableMessage
+            mainAlertMessage = currencyConversionUnavailableMessage(
+                amount: amount,
+                sourceCurrency: mainSelectedCurrency,
+                targetCurrency: currency
+            )
             return
         }
 
@@ -1500,6 +1536,14 @@ struct ContentView: View {
             }
         }
 
+        guard selectedCurrency.isSupportedByCurrentExchangeRateSource else {
+            return currencyConversionUnavailableMessage(
+                amount: amount,
+                sourceCurrency: selectedCurrency,
+                targetCurrency: currency
+            )
+        }
+
         if expenseDates.contains(where: {
             ExpenseCalculations.requiresHistoricalExchangeRate(
                 expenseDate: $0,
@@ -1514,7 +1558,11 @@ struct ContentView: View {
         }
 
         guard let conversion = CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: currency) else {
-            return currencyConversionUnavailableMessage
+            return currencyConversionUnavailableMessage(
+                amount: amount,
+                sourceCurrency: selectedCurrency,
+                targetCurrency: currency
+            )
         }
 
         switch mode {
@@ -2447,7 +2495,7 @@ private struct SettingsView: View {
 
                     Section(appLanguage.text(he: "העדפות", en: "Preferences")) {
                         Picker(appLanguage.text(he: "מטבע ראשי", en: "Primary Currency"), selection: $currency) {
-                            ForEach(CurrencyOption.allCases) { currency in
+                            ForEach(CurrencyOption.selectableCases) { currency in
                                 Text(currency.title(for: appLanguage)).tag(currency)
                             }
                         }
@@ -5122,6 +5170,7 @@ private struct TemporaryCurrencySheet: View {
     let onSelectCurrentExpense: (CurrencyOption) -> Void
     let onSelectDateRange: (CurrencyOption, Date, Date) -> Void
     let onClose: () -> Void
+    let allowsDateRange: Bool
 
     @State private var draftCurrency: CurrencyOption?
     @State private var isCurrencyPickerExpanded = false
@@ -5134,13 +5183,15 @@ private struct TemporaryCurrencySheet: View {
         primaryCurrency: CurrencyOption,
         onSelectCurrentExpense: @escaping (CurrencyOption) -> Void,
         onSelectDateRange: @escaping (CurrencyOption, Date, Date) -> Void,
-        onClose: @escaping () -> Void
+        onClose: @escaping () -> Void,
+        allowsDateRange: Bool = true
     ) {
         self.selectedCurrency = selectedCurrency
         self.primaryCurrency = primaryCurrency
         self.onSelectCurrentExpense = onSelectCurrentExpense
         self.onSelectDateRange = onSelectDateRange
         self.onClose = onClose
+        self.allowsDateRange = allowsDateRange
         _draftCurrency = State(initialValue: selectedCurrency == primaryCurrency ? nil : selectedCurrency)
     }
 
@@ -5148,7 +5199,7 @@ private struct TemporaryCurrencySheet: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: appLanguage.horizontalAlignment, spacing: 18) {
-                    Text(appLanguage.text(he: "מטבע זמני", en: "Temporary Currency"))
+                    Text(sheetTitle)
                         .font(.title3.bold())
                         .frame(maxWidth: .infinity, alignment: .center)
 
@@ -5160,41 +5211,61 @@ private struct TemporaryCurrencySheet: View {
 
                     exchangeRateView
 
-                    VStack(alignment: appLanguage.horizontalAlignment, spacing: 12) {
-                        Text(appLanguage.text(he: "משך שימוש", en: "Usage Mode"))
-                            .font(.headline)
-                            .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
+                    if allowsDateRange {
+                        VStack(alignment: appLanguage.horizontalAlignment, spacing: 12) {
+                            Text(appLanguage.text(he: "משך שימוש", en: "Usage Mode"))
+                                .font(.headline)
+                                .frame(maxWidth: .infinity, alignment: appLanguage.frameAlignment)
 
-                        Picker(appLanguage.text(he: "משך שימוש", en: "Usage Mode"), selection: $usageMode) {
-                            ForEach(TemporaryCurrencyUsageMode.allCases) { mode in
-                                Text(mode.title(for: appLanguage)).tag(mode)
+                            Picker(appLanguage.text(he: "משך שימוש", en: "Usage Mode"), selection: $usageMode) {
+                                ForEach(availableUsageModes) { mode in
+                                    Text(mode.title(for: appLanguage)).tag(mode)
+                                }
                             }
-                        }
-                        .pickerStyle(.segmented)
+                            .pickerStyle(.segmented)
 
-                        if usageMode == .dateRange {
-                            VStack(alignment: appLanguage.horizontalAlignment, spacing: 10) {
-                                DatePicker(appLanguage.text(he: "מתאריך", en: "Start Date"), selection: $startDate, displayedComponents: .date)
-                                    .datePickerStyle(.compact)
+                            if usageMode == .dateRange {
+                                VStack(alignment: appLanguage.horizontalAlignment, spacing: 10) {
+                                    DatePicker(appLanguage.text(he: "מתאריך", en: "Start Date"), selection: $startDate, displayedComponents: .date)
+                                        .datePickerStyle(.compact)
 
-                                DatePicker(appLanguage.text(he: "עד תאריך", en: "End Date"), selection: $endDate, in: startDate..., displayedComponents: .date)
-                                    .datePickerStyle(.compact)
+                                    DatePicker(appLanguage.text(he: "עד תאריך", en: "End Date"), selection: $endDate, in: startDate..., displayedComponents: .date)
+                                        .datePickerStyle(.compact)
+                                }
+                                .padding(12)
+                                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                             }
-                            .padding(12)
-                            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        }
 
+                            Button {
+                                guard let draftCurrency else {
+                                    isCurrencyPickerExpanded = true
+                                    return
+                                }
+
+                                if usageMode == .currentExpense {
+                                    onSelectCurrentExpense(draftCurrency)
+                                } else {
+                                    onSelectDateRange(draftCurrency, startDate, endDate)
+                                }
+                            } label: {
+                                Text(primaryActionTitle)
+                                    .font(.headline)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(draftCurrency == nil || draftCurrency?.isSupportedByCurrentExchangeRateSource == false)
+                        }
+                        .padding(14)
+                        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    } else {
                         Button {
-                            guard let draftCurrency else {
+                            guard let draftCurrency, draftCurrency.isSupportedByCurrentExchangeRateSource else {
                                 isCurrencyPickerExpanded = true
                                 return
                             }
 
-                            if usageMode == .currentExpense {
-                                onSelectCurrentExpense(draftCurrency)
-                            } else {
-                                onSelectDateRange(draftCurrency, startDate, endDate)
-                            }
+                            onSelectCurrentExpense(draftCurrency)
                         } label: {
                             Text(primaryActionTitle)
                                 .font(.headline)
@@ -5202,19 +5273,14 @@ private struct TemporaryCurrencySheet: View {
                                 .padding(.vertical, 10)
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(draftCurrency == nil)
+                        .disabled(draftCurrency == nil || draftCurrency?.isSupportedByCurrentExchangeRateSource == false)
                     }
-                    .padding(14)
-                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-                    Text(appLanguage.text(
-                        he: "המטבע הראשי נשאר \(primaryCurrency.code). המטבע הזמני חל רק על הוצאות ממסך הבית.",
-                        en: "Your primary currency remains \(primaryCurrency.code). The temporary currency applies only to Home-screen expenses."
-                    ))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
+                    Text(footerText)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
                 }
                 .padding(20)
             }
@@ -5238,6 +5304,28 @@ private struct TemporaryCurrencySheet: View {
 
     private var availableTemporaryCurrencies: [CurrencyOption] {
         CurrencyOption.allCases.filter { $0 != primaryCurrency }
+    }
+
+    private var sheetTitle: String {
+        allowsDateRange
+            ? appLanguage.text(he: "מטבע זמני", en: "Temporary Currency")
+            : appLanguage.text(he: "מטבע הוצאה", en: "Expense Currency")
+    }
+
+    private var footerText: String {
+        allowsDateRange
+            ? appLanguage.text(
+                he: "המטבע הראשי נשאר \(primaryCurrency.code). המטבע הזמני חל רק על הוצאות ממסך הבית.",
+                en: "Your primary currency remains \(primaryCurrency.code). The temporary currency applies only to Home-screen expenses."
+            )
+            : appLanguage.text(
+                he: "המטבע הראשי נשאר \(primaryCurrency.code). הבחירה חלה רק על ההוצאה הזו.",
+                en: "Your primary currency remains \(primaryCurrency.code). This selection applies only to this expense."
+            )
+    }
+
+    private var availableUsageModes: [TemporaryCurrencyUsageMode] {
+        allowsDateRange ? TemporaryCurrencyUsageMode.allCases : [.currentExpense]
     }
 
     private var primaryActionTitle: String {
@@ -5337,6 +5425,10 @@ private struct TemporaryCurrencySheet: View {
             LazyVStack(spacing: 0) {
                 ForEach(availableTemporaryCurrencies) { currency in
                     Button {
+                        guard currency.isSupportedByCurrentExchangeRateSource else {
+                            return
+                        }
+
                         draftCurrency = currency
                         withAnimation(.easeInOut(duration: 0.18)) {
                             isCurrencyPickerExpanded = false
@@ -5353,6 +5445,12 @@ private struct TemporaryCurrencySheet: View {
                                 Text(currency.title(for: appLanguage))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+
+                                if let unsupportedMessage = currency.unsupportedExchangeRateMessage(for: appLanguage) {
+                                    Text(unsupportedMessage)
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.orange)
+                                }
                             }
 
                             Spacer()
@@ -5362,11 +5460,12 @@ private struct TemporaryCurrencySheet: View {
                                     .foregroundStyle(Color.accentColor)
                             }
                         }
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(currency.isSupportedByCurrentExchangeRateSource ? .primary : .secondary)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
                     }
                     .buttonStyle(.plain)
+                    .disabled(!currency.isSupportedByCurrentExchangeRateSource)
 
                     if currency.id != availableTemporaryCurrencies.last?.id {
                         Divider()
@@ -5393,6 +5492,10 @@ private struct TemporaryCurrencySheet: View {
                 if let conversion = CurrencyExchangeService.convert(amount: 1, from: draftCurrency, to: primaryCurrency) {
                     Text("1 \(draftCurrency.code) = \(conversion.convertedAmount.plainString) \(primaryCurrency.code)")
                         .font(.headline)
+                } else if let unsupportedMessage = draftCurrency.unsupportedExchangeRateMessage(for: appLanguage) {
+                    Text(unsupportedMessage)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.orange)
                 } else {
                     Text(appLanguage.text(he: "שער לא זמין", en: "Exchange rate unavailable"))
                         .font(.subheadline.weight(.semibold))
@@ -8934,16 +9037,7 @@ private struct MonthNavigationView: View {
             .accessibilityLabel(appLanguage.text(he: "חודש", en: "Month"))
             .accessibilityValue(selectedMonth.monthYearText(for: appLanguage))
             .popover(isPresented: $isMonthPickerPresented) {
-                DatePicker(appLanguage.text(he: "חודש", en: "Month"), selection: $selectedMonth, displayedComponents: .date)
-                    .datePickerStyle(.graphical)
-                    .padding()
-                    .frame(minWidth: 320)
-                    .onChange(of: selectedMonth) {
-                        clampSelectedMonthToMaximum()
-                    }
-                    .environment(\.layoutDirection, appLanguage.layoutDirection)
-                    .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
-                    .presentationCompactAdaptation(.popover)
+                monthPicker
             }
 
             Spacer()
@@ -8958,6 +9052,30 @@ private struct MonthNavigationView: View {
             .accessibilityLabel(accessibilityLabel(for: rightMonthOffset))
         }
         .environment(\.layoutDirection, .leftToRight)
+    }
+
+    @ViewBuilder
+    private var monthPicker: some View {
+        if let maximumMonth {
+            DatePicker(appLanguage.text(he: "חודש", en: "Month"), selection: $selectedMonth, in: ...maximumMonth, displayedComponents: .date)
+                .datePickerStyle(.graphical)
+                .padding()
+                .frame(minWidth: 320)
+                .onChange(of: selectedMonth) {
+                    clampSelectedMonthToMaximum()
+                }
+                .environment(\.layoutDirection, appLanguage.layoutDirection)
+                .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
+                .presentationCompactAdaptation(.popover)
+        } else {
+            DatePicker(appLanguage.text(he: "חודש", en: "Month"), selection: $selectedMonth, displayedComponents: .date)
+                .datePickerStyle(.graphical)
+                .padding()
+                .frame(minWidth: 320)
+                .environment(\.layoutDirection, appLanguage.layoutDirection)
+                .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
+                .presentationCompactAdaptation(.popover)
+        }
     }
 
     private var leftMonthOffset: Int {
@@ -9402,9 +9520,11 @@ private struct EditExpenseView: View {
                         }
 
                         guard let conversion else {
-                            errorMessage = appLanguage.text(
-                                he: "לא ניתן להמיר את המטבע שנבחר",
-                                en: "Could not convert the selected currency"
+                            errorMessage = currencyConversionUnavailableText(
+                                amount: amount,
+                                sourceCurrency: selectedCurrency,
+                                targetCurrency: primaryCurrency,
+                                language: appLanguage
                             )
                             return
                         }
@@ -9452,7 +9572,7 @@ private struct EditExpenseView: View {
             isPresented: $isCurrencyPickerPresented,
             titleVisibility: .visible
         ) {
-            ForEach(CurrencyOption.allCases) { currency in
+            ForEach(CurrencyOption.selectableCases) { currency in
                 Button(currency.selectorTitle) {
                     selectedCurrency = currency
                 }
@@ -9602,9 +9722,11 @@ private struct HistoricalExpenseEditorView: View {
                         }
 
                         guard let conversion = CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: primaryCurrency) else {
-                            errorMessage = appLanguage.text(
-                                he: "לא ניתן להמיר את המטבע שנבחר",
-                                en: "Could not convert the selected currency"
+                            errorMessage = currencyConversionUnavailableText(
+                                amount: amount,
+                                sourceCurrency: selectedCurrency,
+                                targetCurrency: primaryCurrency,
+                                language: appLanguage
                             )
                             return
                         }
@@ -9656,7 +9778,7 @@ private struct HistoricalExpenseEditorView: View {
             isPresented: $isCurrencyPickerPresented,
             titleVisibility: .visible
         ) {
-            ForEach(CurrencyOption.allCases) { currency in
+            ForEach(CurrencyOption.selectableCases) { currency in
                 Button(currency.selectorTitle) {
                     selectedCurrency = currency
                 }
@@ -10556,6 +10678,7 @@ private struct BackfillExpenseView: View {
     @State private var expenseName = ""
     @State private var amountText = ""
     @State private var selectedCurrency = Storage.loadCurrency()
+    @State private var isCurrencyPickerPresented = false
     @State private var selectedMonth = Date()
     @State private var monthCount = 1
     @State private var categoryMode: RecurringCategoryMode = .existing
@@ -10598,20 +10721,16 @@ private struct BackfillExpenseView: View {
                             errorMessage = nil
                         }
 
-                    AmountInputField(amountText: $amountText)
+                    AmountInputField(
+                        amountText: $amountText,
+                        selectedCurrency: $selectedCurrency,
+                        onCurrencyButtonTapped: {
+                            isCurrencyPickerPresented = true
+                        }
+                    )
                         .onChange(of: amountText) {
                             errorMessage = nil
                         }
-
-                    Picker(appLanguage.text(he: "מטבע", en: "Currency"), selection: $selectedCurrency) {
-                        ForEach(CurrencyOption.allCases) { currency in
-                            Text(currency.selectorTitle).tag(currency)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .onChange(of: selectedCurrency) {
-                        errorMessage = nil
-                    }
 
                     if selectedCurrency != Storage.loadCurrency() {
                         Text(appLanguage.text(
@@ -10622,7 +10741,7 @@ private struct BackfillExpenseView: View {
                         .foregroundStyle(.secondary)
                     }
 
-                    MonthNavigationView(selectedMonth: $selectedMonth)
+                    MonthNavigationView(selectedMonth: $selectedMonth, maximumMonth: Date())
 
                     if mode == .recurring {
                         Stepper(value: $monthCount, in: 1...120) {
@@ -10692,12 +10811,34 @@ private struct BackfillExpenseView: View {
         }
         .environment(\.layoutDirection, appLanguage.layoutDirection)
         .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
+        .sheet(isPresented: $isCurrencyPickerPresented) {
+            TemporaryCurrencySheet(
+                selectedCurrency: selectedCurrency,
+                primaryCurrency: Storage.loadCurrency(),
+                onSelectCurrentExpense: { currency in
+                    selectedCurrency = currency
+                    errorMessage = nil
+                    isCurrencyPickerPresented = false
+                },
+                onSelectDateRange: { _, _, _ in },
+                onClose: {
+                    isCurrencyPickerPresented = false
+                },
+                allowsDateRange: false
+            )
+            .presentationDetents([.medium, .large])
+            .localizedPresentationEnvironment(appLanguage)
+        }
         .onAppear {
             selectedCategoryId = categories.first?.id
+            clampSelectedMonth()
 
             if categories.isEmpty {
                 categoryMode = .new
             }
+        }
+        .onChange(of: selectedMonth) {
+            clampSelectedMonth()
         }
     }
 
@@ -10716,6 +10857,8 @@ private struct BackfillExpenseView: View {
             return
         }
 
+        clampSelectedMonth()
+
         errorMessage = onSave(
             mode,
             amount,
@@ -10726,6 +10869,13 @@ private struct BackfillExpenseView: View {
             categoryMode == .new ? newCategoryName : nil,
             expenseName
         )
+    }
+
+    private func clampSelectedMonth() {
+        let maxMonth = Calendar.current.normalizedMonthDate(for: Date())
+        if Calendar.current.normalizedMonthDate(for: selectedMonth) > maxMonth {
+            selectedMonth = maxMonth
+        }
     }
 
     private func sanitizeAmountInput(_ input: String) -> String {
@@ -12549,6 +12699,35 @@ private enum CurrencyOption: String, CaseIterable, Identifiable, Codable {
 
     var selectorTitle: String {
         "\(code) \(symbol)"
+    }
+
+    var isSupportedByCurrentExchangeRateSource: Bool {
+        switch self {
+        case .thb:
+            false
+        default:
+            true
+        }
+    }
+
+    static var selectableCases: [CurrencyOption] {
+        allCases.filter(\.isSupportedByCurrentExchangeRateSource)
+    }
+
+    func unsupportedExchangeRateMessage(for language: AppLanguage) -> String? {
+        guard !isSupportedByCurrentExchangeRateSource else {
+            return nil
+        }
+
+        switch self {
+        case .thb:
+            return language.text(
+                he: "שער המרה לבאט תאילנדי לא זמין כרגע",
+                en: "Thai baht exchange rate is currently unavailable"
+            )
+        default:
+            return nil
+        }
     }
 
     var title: String {
