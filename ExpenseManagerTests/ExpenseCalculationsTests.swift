@@ -24,27 +24,46 @@ final class ExpenseCalculationsTests: XCTestCase {
         XCTAssertNil(ExpenseCalculations.budget(spentAmount: 500, targetAmount: 0))
     }
 
-    func testMonthlySummaryTotalTargetProgress() {
+    func testUndoDurationIsClampedToSupportedRange() {
+        XCTAssertEqual(ExpenseCalculations.clampedUndoDuration(-1), 1)
+        XCTAssertEqual(ExpenseCalculations.clampedUndoDuration(3), 3)
+        XCTAssertEqual(ExpenseCalculations.clampedUndoDuration(9), 5)
+    }
+
+    func testMonthlySummaryTotalTargetProgressIncludesUntargetedCategories() {
         let calendar = Calendar(identifier: .gregorian)
         let july = calendar.date(from: DateComponents(year: 2026, month: 7, day: 10))!
+        let foodSpent = Decimal(string: "680.48")!
+        let homeSpent = Decimal(string: "5010.4")!
+        let shoppingSpent = Decimal(string: "300517.36")!
+        let totalSpent = Decimal(string: "306208.24")!
+        let foodTarget = Decimal(string: "100")!
         let entries = [
-            ExpenseCalculations.DatedNetAmount(categoryId: "food", date: july, netAmount: 70),
-            ExpenseCalculations.DatedNetAmount(categoryId: "shopping", date: july, netAmount: 0),
-            ExpenseCalculations.DatedNetAmount(categoryId: "no-target", date: july, netAmount: 999)
+            ExpenseCalculations.DatedNetAmount(categoryId: "food", date: july, netAmount: foodSpent),
+            ExpenseCalculations.DatedNetAmount(categoryId: "home", date: july, netAmount: homeSpent),
+            ExpenseCalculations.DatedNetAmount(categoryId: "shopping", date: july, netAmount: shoppingSpent)
         ]
         let progress = ExpenseCalculations.monthlyTargetProgress(
             for: entries,
             categoryTargets: [
-                "food": 100,
-                "shopping": 80
+                "food": foodTarget
             ],
             month: july,
             calendar: calendar
         )
 
-        XCTAssertEqual(progress?.spentAmount, 70)
-        XCTAssertEqual(progress?.targetAmount, 180)
-        XCTAssertEqual(progress?.budget.remainingAmount, 110)
+        XCTAssertEqual(progress?.spentAmount, totalSpent)
+        XCTAssertEqual(progress?.targetAmount, foodTarget)
+        XCTAssertEqual(progress?.budget.overBudgetAmount, Decimal(string: "306108.24")!)
+        XCTAssertEqual(
+            ExpenseCalculations.monthlyNetExpenseTotal(
+                for: entries,
+                categoryId: "food",
+                month: july,
+                calendar: calendar
+            ),
+            foodSpent
+        )
     }
 
     func testFullRefundMakesNetExpenseZero() {

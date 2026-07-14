@@ -93,14 +93,11 @@ enum ExpenseCalculations {
             return nil
         }
 
-        let spentAmount = positiveTargets.keys.reduce(Decimal(0)) { total, categoryId in
-            total + monthlyNetExpenseTotal(
-                for: entries,
-                categoryId: categoryId,
-                month: month,
-                calendar: calendar
-            )
-        }
+        let spentAmount = monthlyNetExpenseTotal(
+            for: entries,
+            month: month,
+            calendar: calendar
+        )
 
         return MonthlyTargetProgress(spentAmount: spentAmount, targetAmount: targetAmount)
     }
@@ -140,5 +137,9 @@ enum ExpenseCalculations {
 
         let clampedRepaidAmount = min(max(repaidAmount, 0), originalAmount)
         return clampedRepaidAmount / originalAmount * 100
+    }
+
+    static func clampedUndoDuration(_ duration: Int) -> Int {
+        min(max(duration, 1), 5)
     }
 }

@@ -23,6 +23,79 @@ private final class AppSettingsStore: ObservableObject {
     }
 }
 
+@MainActor
+private final class UndoToastStore: ObservableObject {
+    struct PendingAction: Identifiable {
+        let id = UUID()
+        let message: String
+        let undo: () -> Void
+    }
+
+    @Published var pendingAction: PendingAction?
+    private var dismissalTask: Task<Void, Never>?
+
+    func show(message: String, duration: TimeInterval, undo: @escaping () -> Void) {
+        dismissalTask?.cancel()
+        pendingAction = PendingAction(message: message, undo: undo)
+
+        dismissalTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
+            guard !Task.isCancelled else {
+                return
+            }
+
+            await MainActor.run {
+                self?.pendingAction = nil
+            }
+        }
+    }
+
+    func undo() {
+        let action = pendingAction
+        dismissalTask?.cancel()
+        pendingAction = nil
+        action?.undo()
+    }
+
+    func clear() {
+        dismissalTask?.cancel()
+        pendingAction = nil
+    }
+}
+
+private struct UndoToastView: View {
+    @ObservedObject var store: UndoToastStore
+    let appLanguage: AppLanguage
+
+    var body: some View {
+        if let action = store.pendingAction {
+            HStack(spacing: 8) {
+                Text(action.message)
+                    .font(.subheadline.weight(.semibold))
+
+                Text("·")
+                    .foregroundStyle(.secondary)
+
+                Button(appLanguage.text(he: "בטל", en: "Undo")) {
+                    store.undo()
+                }
+                .font(.subheadline.weight(.bold))
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.regularMaterial, in: Capsule())
+            .shadow(color: .black.opacity(0.18), radius: 18, x: 0, y: 8)
+            .padding(.horizontal, 18)
+            .padding(.bottom, 96)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: appLanguage == .he ? .bottomTrailing : .bottomLeading)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .zIndex(20)
+            .environment(\.layoutDirection, appLanguage.layoutDirection)
+        }
+    }
+}
+
 private extension View {
     func localizedPresentationEnvironment(_ language: AppLanguage) -> some View {
         environment(\.appLanguage, language)
@@ -100,8 +173,8 @@ private func currencyConversionUnavailableText(
 ) -> String {
     if sourceCurrency == .thb && targetCurrency == .ils {
         return language.text(
-            he: "לא ניתן להמיר \(amount.plainString) באט לשקלים כרגע כי שער ההמרה לבאט תאילנדי לא זמין.",
-            en: "Cannot convert \(amount.plainString) Thai baht to shekels right now because the Thai baht exchange rate is unavailable."
+            he: "לא ניתן להמיר \(amount.plainString) באט לשקלים כרגע כי שער באט לא זמין. ניתן להזין שער ידנית.",
+            en: "Cannot convert \(amount.plainString) Thai baht to shekels right now because the baht rate is unavailable. You can enter a manual rate."
         )
     }
 
@@ -182,6 +255,7 @@ private struct FixedHebrewVisualText: View {
 
 struct ContentView: View {
     @StateObject private var appSettings = AppSettingsStore()
+    @StateObject private var undoToastStore = UndoToastStore()
     @State private var currentCategoryIndex = 0
     @State private var amountText = ""
     @State private var mainSelectedCurrency: CurrencyOption = Storage.loadTemporaryCurrency(primaryCurrency: Storage.loadCurrency())
@@ -200,6 +274,8 @@ struct ContentView: View {
     @State private var dateDisplayFormat: DateDisplayFormat = .dayMonthYear
     @State private var salaryReceiptDay = 1
     @State private var checkingBalance: Decimal?
+    @State private var isUndoEnabled = Storage.loadUndoEnabled()
+    @State private var undoDuration = Storage.loadUndoDuration()
     @State private var isUserNamePromptPresented = false
     @State private var isSalaryPromptPresented = false
     @State private var didSkipSalaryPromptThisSession = false
@@ -304,6 +380,14 @@ struct ContentView: View {
         )
     }
 
+    private func presentUndo(message: String, undo: @escaping () -> Void) {
+        guard isUndoEnabled else {
+            return
+        }
+
+        undoToastStore.show(message: message, duration: TimeInterval(undoDuration), undo: undo)
+    }
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             mainContent
@@ -392,11 +476,15 @@ struct ContentView: View {
                 languageRefreshOverlay
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
             }
+
+            UndoToastView(store: undoToastStore, appLanguage: appLanguage)
+                .animation(.easeInOut(duration: 0.18), value: undoToastStore.pendingAction?.id)
         }
         .background(Color(.systemGroupedBackground))
         .environment(\.layoutDirection, appLanguage.layoutDirection)
         .environment(\.appLanguage, appLanguage)
         .environment(\.locale, Locale(identifier: appLanguage.localeIdentifier))
+        .environmentObject(undoToastStore)
         .preferredColorScheme(appTheme.colorScheme)
         .id(rootRefreshID)
         .onAppear {
@@ -502,6 +590,8 @@ struct ContentView: View {
                 dateDisplayFormat: dateDisplayFormatBinding,
                 salaryReceiptDay: $salaryReceiptDay,
                 checkingBalance: $checkingBalance,
+                isUndoEnabled: $isUndoEnabled,
+                undoDuration: $undoDuration,
                 onSaveUserName: { name in
                     userName = name
                     Storage.saveUserName(name)
@@ -1149,6 +1239,9 @@ struct ContentView: View {
             originalCurrencyCode: mainSelectedCurrency.code,
             exchangeRate: conversion.exchangeRate,
             exchangeRateDate: conversion.exchangeRateDate,
+            exchangeRateSource: conversion.exchangeRateSource,
+            exchangeRateMethod: conversion.exchangeRateMethod,
+            fetchedAt: conversion.fetchedAt,
             convertedAmount: conversion.convertedAmount,
             convertedCurrencyCode: currency.code
         )
@@ -1231,6 +1324,10 @@ struct ContentView: View {
     private func saveExpense(_ expense: Expense) {
         expenses.append(expense)
         Storage.saveExpenses(expenses)
+        presentUndo(message: appLanguage.text(he: "נוספה הוצאה", en: "Expense added")) {
+            expenses.removeAll { $0.id == expense.id }
+            Storage.saveExpenses(expenses)
+        }
         pendingExpense = nil
         expenseName = ""
         amountText = ""
@@ -1374,6 +1471,7 @@ struct ContentView: View {
             return
         }
 
+        let previousCategory = categories[index]
         categories[index] = categories[index].updated(
             name: categories[index].name,
             systemImageName: categories[index].systemImageName,
@@ -1381,6 +1479,15 @@ struct ContentView: View {
             monthlyTarget: monthlyTarget
         )
         Storage.saveCategories(categories)
+        let updatedCategoryId = categories[index].id
+        presentUndo(message: appLanguage.text(he: "נערך יעד קטגוריה", en: "Category target edited")) {
+            guard let restoreIndex = categories.firstIndex(where: { $0.id == updatedCategoryId }) else {
+                return
+            }
+
+            categories[restoreIndex] = previousCategory
+            Storage.saveCategories(categories)
+        }
     }
 
     private func saveAddedExpense(
@@ -1401,7 +1508,7 @@ struct ContentView: View {
             return appLanguage.text(he: "צריך לבחור קטגוריה", en: "Choose a category")
         }
 
-        expenses.append(Expense(
+        let expense = Expense(
             categoryId: category.id,
             categoryName: category.name,
             amount: amount,
@@ -1409,8 +1516,13 @@ struct ContentView: View {
             date: date,
             name: trimmedName.isEmpty ? nil : trimmedName,
             isRecurring: isRecurring
-        ))
+        )
+        expenses.append(expense)
         Storage.saveExpenses(expenses)
+        presentUndo(message: appLanguage.text(he: "נוספה הוצאה", en: "Expense added")) {
+            expenses.removeAll { $0.id == expense.id }
+            Storage.saveExpenses(expenses)
+        }
 
         if isRecurring {
             recurringExpenses.append(RecurringExpense(
@@ -1433,6 +1545,11 @@ struct ContentView: View {
         storedSavings.append(saving)
         storedSavings.sort { $0.date > $1.date }
         Storage.saveSavings(storedSavings)
+        presentUndo(message: saving.kind == .withdrawal ? appLanguage.text(he: "בוצעה משיכה מחיסכון", en: "Saving withdrawn") : appLanguage.text(he: "נוסף חסכון", en: "Saving added")) {
+            var restoredSavings = Storage.loadSavings()
+            restoredSavings.removeAll { $0.id == saving.id }
+            Storage.saveSavings(restoredSavings)
+        }
         isMainAddSavingPresented = false
     }
 
@@ -1449,6 +1566,11 @@ struct ContentView: View {
         storedDebts.append(debt)
         storedDebts.sort { $0.date > $1.date }
         Storage.saveDebts(storedDebts)
+        presentUndo(message: appLanguage.text(he: "נוסף חוב", en: "Debt added")) {
+            var restoredDebts = Storage.loadDebts()
+            restoredDebts.removeAll { $0.id == debt.id }
+            Storage.saveDebts(restoredDebts)
+        }
         isMainAddDebtPresented = false
     }
 
@@ -1511,7 +1633,7 @@ struct ContentView: View {
         existingCategoryId: String?,
         newCategoryName: String?,
         expenseName: String
-    ) -> String? {
+    ) async -> String? {
         let trimmedExpenseName = expenseName.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard amount > 0 else {
@@ -1536,37 +1658,11 @@ struct ContentView: View {
             }
         }
 
-        guard selectedCurrency.isSupportedByCurrentExchangeRateSource else {
-            return currencyConversionUnavailableMessage(
-                amount: amount,
-                sourceCurrency: selectedCurrency,
-                targetCurrency: currency
-            )
-        }
-
-        if expenseDates.contains(where: {
-            ExpenseCalculations.requiresHistoricalExchangeRate(
-                expenseDate: $0,
-                sourceCurrencyCode: selectedCurrency.code,
-                primaryCurrencyCode: currency.code
-            )
-        }) {
-            return appLanguage.text(
-                he: "לא ניתן להוסיף הוצאה בדיעבד במטבע זר בלי שער היסטורי לתאריך ההוצאה",
-                en: "Past foreign-currency expenses require a historical exchange rate for the expense date"
-            )
-        }
-
-        guard let conversion = CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: currency) else {
-            return currencyConversionUnavailableMessage(
-                amount: amount,
-                sourceCurrency: selectedCurrency,
-                targetCurrency: currency
-            )
-        }
-
         switch mode {
         case .oneTime:
+            guard let conversion = await CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: currency, on: month) else {
+                return historicalExchangeRateUnavailableMessage(for: selectedCurrency)
+            }
             let exchangeRateDate = selectedCurrency == currency ? month : conversion.exchangeRateDate
             expenses.append(Expense(
                 categoryId: category.id,
@@ -1580,11 +1676,17 @@ struct ContentView: View {
                 originalCurrencyCode: selectedCurrency.code,
                 exchangeRate: conversion.exchangeRate,
                 exchangeRateDate: exchangeRateDate,
+                exchangeRateSource: conversion.exchangeRateSource,
+                exchangeRateMethod: conversion.exchangeRateMethod,
+                fetchedAt: conversion.fetchedAt,
                 convertedAmount: conversion.convertedAmount,
                 convertedCurrencyCode: currency.code
             ))
         case .recurring:
             for expenseDate in expenseDates {
+                guard let conversion = await CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: currency, on: expenseDate) else {
+                    return historicalExchangeRateUnavailableMessage(for: selectedCurrency)
+                }
                 let exchangeRateDate = selectedCurrency == currency ? expenseDate : conversion.exchangeRateDate
                 expenses.append(Expense(
                     categoryId: category.id,
@@ -1598,6 +1700,9 @@ struct ContentView: View {
                     originalCurrencyCode: selectedCurrency.code,
                     exchangeRate: conversion.exchangeRate,
                     exchangeRateDate: exchangeRateDate,
+                    exchangeRateSource: conversion.exchangeRateSource,
+                    exchangeRateMethod: conversion.exchangeRateMethod,
+                    fetchedAt: conversion.fetchedAt,
                     convertedAmount: conversion.convertedAmount,
                     convertedCurrencyCode: currency.code
                 ))
@@ -1608,6 +1713,20 @@ struct ContentView: View {
         isBackfillExpensePresented = false
 
         return nil
+    }
+
+    private func historicalExchangeRateUnavailableMessage(for currency: CurrencyOption) -> String {
+        if currency == .thb {
+            return appLanguage.text(
+                he: "לא נמצא שער היסטורי לבאט תאילנדי לתאריך הזה. נסה תאריך אחר או הזן שער ידנית.",
+                en: "No historical Thai baht rate was found for this date. Try another date or enter a manual rate."
+            )
+        }
+
+        return appLanguage.text(
+            he: "לא נמצא שער היסטורי לתאריך הזה. נסה תאריך אחר או הזן שער ידנית.",
+            en: "No historical rate was found for this date. Try another date or enter a manual rate."
+        )
     }
 
     private func resolveCategory(
@@ -1693,6 +1812,8 @@ struct ContentView: View {
         Storage.saveDateDisplayFormat(dateDisplayFormat)
         Storage.saveSalaryReceiptDay(salaryReceiptDay)
         Storage.saveCheckingBalance(checkingBalance)
+        Storage.saveUndoEnabled(isUndoEnabled)
+        Storage.saveUndoDuration(undoDuration)
     }
 
     private func refreshLanguageUI() {
@@ -1745,6 +1866,7 @@ struct ContentView: View {
         ))
 
         Storage.resetAllAppData()
+        undoToastStore.clear()
 
         amountText = ""
         expenses = []
@@ -1759,6 +1881,8 @@ struct ContentView: View {
         dateDisplayFormat = .dayMonthYear
         salaryReceiptDay = 1
         checkingBalance = nil
+        isUndoEnabled = Storage.loadUndoEnabled()
+        undoDuration = Storage.loadUndoDuration()
         isUserNamePromptPresented = false
         isSalaryPromptPresented = false
         didSkipSalaryPromptThisSession = false
@@ -1802,6 +1926,7 @@ struct ContentView: View {
     }
 
     private func restoreSnapshot(_ snapshot: RestoreSnapshot) {
+        undoToastStore.clear()
         expenses = snapshot.expenses
         recurringExpenses = snapshot.recurringExpenses
         salaryEntries = snapshot.salaryEntries
@@ -1897,10 +2022,16 @@ struct ContentView: View {
             return
         }
 
+        let previousEntries = salaryEntries
+        let entry = SalaryEntry(year: year, month: month, amount: amount, createdAt: Date())
         salaryEntries.removeAll { $0.year == year && $0.month == month }
-        salaryEntries.append(SalaryEntry(year: year, month: month, amount: amount, createdAt: Date()))
+        salaryEntries.append(entry)
         salaryEntries.sort { $0.monthDate > $1.monthDate }
         Storage.saveSalaryEntries(salaryEntries)
+        presentUndo(message: appLanguage.text(he: "נוספה הכנסה", en: "Income added")) {
+            salaryEntries = previousEntries
+            Storage.saveSalaryEntries(salaryEntries)
+        }
         isSalaryPromptPresented = false
     }
 
@@ -1920,6 +2051,8 @@ struct ContentView: View {
         appSettings.language = Storage.loadAppLanguage()
         salaryReceiptDay = Storage.loadSalaryReceiptDay()
         checkingBalance = Storage.loadCheckingBalance()
+        isUndoEnabled = Storage.loadUndoEnabled()
+        undoDuration = Storage.loadUndoDuration()
         isInitialSetupPresented = !Storage.isInitialSetupCompleted() || !isValidSetupUserName(userName)
         isUserNamePromptPresented = false
     }
@@ -2455,6 +2588,8 @@ private struct SettingsView: View {
     @Binding var dateDisplayFormat: DateDisplayFormat
     @Binding var salaryReceiptDay: Int
     @Binding var checkingBalance: Decimal?
+    @Binding var isUndoEnabled: Bool
+    @Binding var undoDuration: Int
     let onSaveUserName: (String) -> Void
     let onPersistSettings: () -> Void
     let onResetApp: () -> Void
@@ -2519,6 +2654,23 @@ private struct SettingsView: View {
                             }
                         }
                         .onChange(of: dateDisplayFormat) {
+                            onPersistSettings()
+                        }
+                    }
+
+                    Section(appLanguage.text(he: "ביטול פעולות", en: "Undo")) {
+                        Toggle(appLanguage.text(he: "ביטול אחרי פעולות", en: "Undo after actions"), isOn: $isUndoEnabled)
+                            .onChange(of: isUndoEnabled) {
+                                onPersistSettings()
+                            }
+
+                        Picker(appLanguage.text(he: "משך ביטול", en: "Undo duration"), selection: $undoDuration) {
+                            ForEach(1...5, id: \.self) { seconds in
+                                Text(appLanguage.text(he: "\(seconds) שניות", en: "\(seconds) seconds")).tag(seconds)
+                            }
+                        }
+                        .disabled(!isUndoEnabled)
+                        .onChange(of: undoDuration) {
                             onPersistSettings()
                         }
                     }
@@ -2896,6 +3048,7 @@ private struct SalaryPromptView: View {
 }
 
 private struct SalaryHistoryView: View {
+    @EnvironmentObject private var undoToastStore: UndoToastStore
     @Binding var salaryEntries: [SalaryEntry]
     let expenses: [Expense]
     let savings: [Saving]
@@ -3060,14 +3213,20 @@ private struct SalaryHistoryView: View {
     }
 
     private func addSalaryEntry(_ entry: SalaryEntry) {
+        let previousEntries = salaryEntries
         salaryEntries.removeAll { $0.year == entry.year && $0.month == entry.month }
         salaryEntries.append(entry)
         salaryEntries.sort { $0.monthDate > $1.monthDate }
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נוספה הכנסה", en: "Income added")) {
+            salaryEntries = previousEntries
+            onPersist()
+        }
         isAddingSalary = false
     }
 
     private func updateSalaryEntry(_ entry: SalaryEntry) {
+        let previousEntries = salaryEntries
         salaryEntries.removeAll { existing in
             existing.id != entry.id && existing.year == entry.year && existing.month == entry.month
         }
@@ -3081,11 +3240,28 @@ private struct SalaryHistoryView: View {
         salaryEntries[index] = entry
         salaryEntries.sort { $0.monthDate > $1.monthDate }
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נערכה הכנסה", en: "Income edited")) {
+            salaryEntries = previousEntries
+            onPersist()
+        }
     }
 
     private func deleteSalaryEntry(_ entry: SalaryEntry) {
+        let previousEntries = salaryEntries
         salaryEntries.removeAll { $0.id == entry.id }
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נמחקה הכנסה", en: "Income deleted")) {
+            salaryEntries = previousEntries
+            onPersist()
+        }
+    }
+
+    private func presentUndo(message: String, undo: @escaping () -> Void) {
+        guard Storage.loadUndoEnabled() else {
+            return
+        }
+
+        undoToastStore.show(message: message, duration: TimeInterval(Storage.loadUndoDuration()), undo: undo)
     }
 }
 
@@ -3150,6 +3326,7 @@ private struct SalaryMonthRow: View {
 
 private struct SavingsManagementView: View {
     @Environment(\.appLanguage) private var appLanguage
+    @EnvironmentObject private var undoToastStore: UndoToastStore
 
     let userName: String
     let onClose: () -> Void
@@ -3450,6 +3627,10 @@ private struct SavingsManagementView: View {
         savings.append(saving)
         savings.sort { $0.date > $1.date }
         Storage.saveSavings(savings)
+        presentUndo(message: saving.kind == .withdrawal ? appLanguage.text(he: "בוצעה משיכה מחיסכון", en: "Saving withdrawn") : appLanguage.text(he: "נוסף חסכון", en: "Saving added")) {
+            savings.removeAll { $0.id == saving.id }
+            Storage.saveSavings(savings)
+        }
         isAddSavingPresented = false
     }
 
@@ -3469,9 +3650,22 @@ private struct SavingsManagementView: View {
     }
 
     private func saveSavingsGoal(_ goal: Decimal?) {
+        let previousGoal = savingsGoal
         savingsGoal = goal
         Storage.saveSavingsGoal(goal)
+        presentUndo(message: appLanguage.text(he: "נערך יעד חיסכון", en: "Saving target edited")) {
+            savingsGoal = previousGoal
+            Storage.saveSavingsGoal(previousGoal)
+        }
         isSavingsGoalEditorPresented = false
+    }
+
+    private func presentUndo(message: String, undo: @escaping () -> Void) {
+        guard Storage.loadUndoEnabled() else {
+            return
+        }
+
+        undoToastStore.show(message: message, duration: TimeInterval(Storage.loadUndoDuration()), undo: undo)
     }
 }
 
@@ -4501,6 +4695,7 @@ private struct AddSavingView: View {
 
 private struct DebtsManagementView: View {
     @Environment(\.appLanguage) private var appLanguage
+    @EnvironmentObject private var undoToastStore: UndoToastStore
 
     let onClose: () -> Void
 
@@ -4594,6 +4789,10 @@ private struct DebtsManagementView: View {
         debts.append(debt)
         debts.sort { $0.date > $1.date }
         Storage.saveDebts(debts)
+        presentUndo(message: appLanguage.text(he: "נוסף חוב", en: "Debt added")) {
+            debts.removeAll { $0.id == debt.id }
+            Storage.saveDebts(debts)
+        }
         isAddDebtPresented = false
     }
 
@@ -4602,8 +4801,25 @@ private struct DebtsManagementView: View {
             return
         }
 
+        let previousDebt = debts[index]
         debts[index] = debt.updatedRepaidAmount(repaidAmount)
         Storage.saveDebts(debts)
+        presentUndo(message: repaidAmount >= debt.amount ? appLanguage.text(he: "חוב סומן כנפרע", en: "Debt marked repaid") : appLanguage.text(he: "נערך החזר חוב", en: "Debt repayment edited")) {
+            guard let restoreIndex = debts.firstIndex(where: { $0.id == previousDebt.id }) else {
+                return
+            }
+
+            debts[restoreIndex] = previousDebt
+            Storage.saveDebts(debts)
+        }
+    }
+
+    private func presentUndo(message: String, undo: @escaping () -> Void) {
+        guard Storage.loadUndoEnabled() else {
+            return
+        }
+
+        undoToastStore.show(message: message, duration: TimeInterval(Storage.loadUndoDuration()), undo: undo)
     }
 }
 
@@ -5177,6 +5393,7 @@ private struct TemporaryCurrencySheet: View {
     @State private var usageMode: TemporaryCurrencyUsageMode = .currentExpense
     @State private var startDate = Date()
     @State private var endDate = Calendar.current.date(byAdding: .day, value: 7, to: Date()) ?? Date()
+    @State private var manualRateText = ""
 
     init(
         selectedCurrency: CurrencyOption,
@@ -5242,6 +5459,10 @@ private struct TemporaryCurrencySheet: View {
                                     return
                                 }
 
+                                guard prepareDraftCurrencyForUse(draftCurrency) else {
+                                    return
+                                }
+
                                 if usageMode == .currentExpense {
                                     onSelectCurrentExpense(draftCurrency)
                                 } else {
@@ -5254,14 +5475,18 @@ private struct TemporaryCurrencySheet: View {
                                     .padding(.vertical, 10)
                             }
                             .buttonStyle(.borderedProminent)
-                            .disabled(draftCurrency == nil || draftCurrency?.isSupportedByCurrentExchangeRateSource == false)
+                            .disabled(!canUseDraftCurrency)
                         }
                         .padding(14)
                         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     } else {
                         Button {
-                            guard let draftCurrency, draftCurrency.isSupportedByCurrentExchangeRateSource else {
+                            guard let draftCurrency else {
                                 isCurrencyPickerExpanded = true
+                                return
+                            }
+
+                            guard prepareDraftCurrencyForUse(draftCurrency) else {
                                 return
                             }
 
@@ -5273,7 +5498,7 @@ private struct TemporaryCurrencySheet: View {
                                 .padding(.vertical, 10)
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(draftCurrency == nil || draftCurrency?.isSupportedByCurrentExchangeRateSource == false)
+                        .disabled(!canUseDraftCurrency)
                     }
 
                     Text(footerText)
@@ -5430,6 +5655,7 @@ private struct TemporaryCurrencySheet: View {
                         }
 
                         draftCurrency = currency
+                        manualRateText = ""
                         withAnimation(.easeInOut(duration: 0.18)) {
                             isCurrencyPickerExpanded = false
                         }
@@ -5492,14 +5718,28 @@ private struct TemporaryCurrencySheet: View {
                 if let conversion = CurrencyExchangeService.convert(amount: 1, from: draftCurrency, to: primaryCurrency) {
                     Text("1 \(draftCurrency.code) = \(conversion.convertedAmount.plainString) \(primaryCurrency.code)")
                         .font(.headline)
+
+                    Text(exchangeRateSourceText(conversion))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 } else if let unsupportedMessage = draftCurrency.unsupportedExchangeRateMessage(for: appLanguage) {
                     Text(unsupportedMessage)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.orange)
                 } else {
-                    Text(appLanguage.text(he: "שער לא זמין", en: "Exchange rate unavailable"))
+                    Text(appLanguage.text(
+                        he: "שער \(draftCurrency.title(for: appLanguage)) לא זמין כרגע. ניתן להזין שער ידנית.",
+                        en: "\(draftCurrency.title(for: appLanguage)) rate is unavailable right now. You can enter a manual rate."
+                    ))
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
+
+                    if primaryCurrency == .ils {
+                        TextField(appLanguage.text(he: "שער ידני ל-ILS", en: "Manual rate to ILS"), text: $manualRateText)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.center)
+                            .textFieldStyle(.roundedBorder)
+                    }
                 }
             } else {
                 Text(appLanguage.text(he: "לא נבחר מטבע זמני", en: "No temporary currency selected"))
@@ -5511,6 +5751,57 @@ private struct TemporaryCurrencySheet: View {
         .padding(12)
         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .environment(\.layoutDirection, .leftToRight)
+    }
+
+    private func exchangeRateSourceText(_ conversion: CurrencyConversionResult) -> String {
+        let sourceText = appLanguage.text(
+            he: "שער לפי \(conversion.exchangeRateSource.title(for: appLanguage))",
+            en: "Rate from \(conversion.exchangeRateSource.title(for: appLanguage))"
+        )
+
+        guard conversion.exchangeRateMethod == .crossRate else {
+            return sourceText
+        }
+
+        return appLanguage.text(
+            he: "\(sourceText) דרך USD",
+            en: "\(sourceText) via USD"
+        )
+    }
+
+    private var canUseDraftCurrency: Bool {
+        guard let draftCurrency else {
+            return false
+        }
+
+        if CurrencyExchangeService.convert(amount: 1, from: draftCurrency, to: primaryCurrency) != nil {
+            return true
+        }
+
+        return primaryCurrency == .ils && parsedManualRateInILS != nil
+    }
+
+    private var parsedManualRateInILS: Decimal? {
+        let trimmedRate = manualRateText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let rate = Decimal(string: trimmedRate, locale: Locale(identifier: "en_US_POSIX")),
+              rate > 0 else {
+            return nil
+        }
+
+        return rate
+    }
+
+    private func prepareDraftCurrencyForUse(_ draftCurrency: CurrencyOption) -> Bool {
+        if CurrencyExchangeService.convert(amount: 1, from: draftCurrency, to: primaryCurrency) != nil {
+            return true
+        }
+
+        guard primaryCurrency == .ils, let manualRate = parsedManualRateInILS else {
+            return false
+        }
+
+        CurrencyExchangeService.saveManualRateInILS(for: draftCurrency, rateInILS: manualRate)
+        return true
     }
 }
 
@@ -7704,6 +7995,7 @@ private struct AnalyticsSectionPlaceholder: View {
 
 private struct PastDataView: View {
     @Environment(\.appLanguage) private var appLanguage
+    @EnvironmentObject private var undoToastStore: UndoToastStore
 
     let categories: [ExpenseCategory]
     @Binding var expenses: [Expense]
@@ -8376,6 +8668,10 @@ private struct PastDataView: View {
         expenses.append(expense)
         expenses.sort { $0.date > $1.date }
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נוספה הוצאה", en: "Expense added")) {
+            expenses.removeAll { $0.id == expense.id }
+            onPersist()
+        }
         isAddingExpense = false
     }
 
@@ -8397,7 +8693,7 @@ private struct PastDataView: View {
             return appLanguage.text(he: "צריך לבחור קטגוריה", en: "Choose a category")
         }
 
-        expenses.append(Expense(
+        let expense = Expense(
             categoryId: category.id,
             categoryName: category.name,
             amount: amount,
@@ -8406,9 +8702,14 @@ private struct PastDataView: View {
             name: trimmedName.isEmpty ? nil : trimmedName,
             isRecurring: isRecurring,
             source: .backfill
-        ))
+        )
+        expenses.append(expense)
         expenses.sort { $0.date > $1.date }
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נוספה הוצאה", en: "Expense added")) {
+            expenses.removeAll { $0.id == expense.id }
+            onPersist()
+        }
 
         if isRecurring {
             var storedRecurringExpenses = Storage.loadRecurringExpenses()
@@ -8431,27 +8732,50 @@ private struct PastDataView: View {
             return
         }
 
+        let previousExpense = expenses[index]
         expenses[index] = expense
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נערכה הוצאה", en: "Expense edited")) {
+            guard let restoreIndex = expenses.firstIndex(where: { $0.id == previousExpense.id }) else {
+                return
+            }
+
+            expenses[restoreIndex] = previousExpense
+            onPersist()
+        }
     }
 
     private func deleteExpense(_ expense: Expense) {
         expenses.removeAll { $0.id == expense.id }
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נמחקה הוצאה", en: "Expense deleted")) {
+            expenses.append(expense)
+            expenses.sort { $0.date > $1.date }
+            onPersist()
+        }
     }
 
     private func addDebt(_ debt: Debt) {
         debts.append(debt)
         debts.sort { $0.date > $1.date }
         Storage.saveDebts(debts)
+        presentUndo(message: appLanguage.text(he: "נוסף חוב", en: "Debt added")) {
+            debts.removeAll { $0.id == debt.id }
+            Storage.saveDebts(debts)
+        }
         isAddingDebt = false
     }
 
     private func addSalaryEntry(_ entry: SalaryEntry) {
+        let previousEntries = salaryEntries
         salaryEntries.removeAll { $0.year == entry.year && $0.month == entry.month }
         salaryEntries.append(entry)
         salaryEntries.sort { $0.monthDate > $1.monthDate }
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נוספה הכנסה", en: "Income added")) {
+            salaryEntries = previousEntries
+            onPersist()
+        }
         isAddingIncome = false
     }
 
@@ -8460,19 +8784,37 @@ private struct PastDataView: View {
             return
         }
 
+        let previousEntry = salaryEntries[index]
         salaryEntries[index] = entry
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נערכה הכנסה", en: "Income edited")) {
+            guard let restoreIndex = salaryEntries.firstIndex(where: { $0.id == previousEntry.id }) else {
+                return
+            }
+
+            salaryEntries[restoreIndex] = previousEntry
+            onPersist()
+        }
     }
 
     private func deleteSalaryEntry(_ entry: SalaryEntry) {
         salaryEntries.removeAll { $0.id == entry.id }
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נמחקה הכנסה", en: "Income deleted")) {
+            salaryEntries.append(entry)
+            salaryEntries.sort { $0.monthDate > $1.monthDate }
+            onPersist()
+        }
     }
 
     private func addSaving(_ saving: Saving) {
         savings.append(saving)
         savings.sort { $0.date > $1.date }
         Storage.saveSavings(savings)
+        presentUndo(message: saving.kind == .withdrawal ? appLanguage.text(he: "בוצעה משיכה מחיסכון", en: "Saving withdrawn") : appLanguage.text(he: "נוסף חסכון", en: "Saving added")) {
+            savings.removeAll { $0.id == saving.id }
+            Storage.saveSavings(savings)
+        }
         isAddingSaving = false
     }
 
@@ -8489,13 +8831,35 @@ private struct PastDataView: View {
             return
         }
 
+        let previousSaving = savings[index]
         savings[index] = saving
         Storage.saveSavings(savings)
+        presentUndo(message: appLanguage.text(he: "נערך חסכון", en: "Saving edited")) {
+            guard let restoreIndex = savings.firstIndex(where: { $0.id == previousSaving.id }) else {
+                return
+            }
+
+            savings[restoreIndex] = previousSaving
+            Storage.saveSavings(savings)
+        }
     }
 
     private func deleteSaving(_ saving: Saving) {
         savings.removeAll { $0.id == saving.id }
         Storage.saveSavings(savings)
+        presentUndo(message: appLanguage.text(he: "נמחקה פעולת חסכון", en: "Saving entry deleted")) {
+            savings.append(saving)
+            savings.sort { $0.date > $1.date }
+            Storage.saveSavings(savings)
+        }
+    }
+
+    private func presentUndo(message: String, undo: @escaping () -> Void) {
+        guard Storage.loadUndoEnabled() else {
+            return
+        }
+
+        undoToastStore.show(message: message, duration: TimeInterval(Storage.loadUndoDuration()), undo: undo)
     }
 }
 
@@ -9507,41 +9871,36 @@ private struct EditExpenseView: View {
                     }
 
                     if selectedCurrency != primaryCurrency {
-                        guard !ExpenseCalculations.requiresHistoricalExchangeRate(
-                            expenseDate: date,
-                            sourceCurrencyCode: selectedCurrency.code,
-                            primaryCurrencyCode: primaryCurrency.code
-                        ) else {
-                            errorMessage = appLanguage.text(
-                                he: "לא ניתן לשמור הוצאה בדיעבד במטבע זר בלי שער היסטורי לתאריך ההוצאה",
-                                en: "Past foreign-currency expenses require a historical exchange rate for the expense date"
-                            )
-                            return
-                        }
+                        Task {
+                            guard let conversion = await CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: primaryCurrency, on: date) else {
+                                await MainActor.run {
+                                    errorMessage = appLanguage.text(
+                                        he: "לא נמצא שער היסטורי לתאריך הזה. נסה תאריך אחר או הזן שער ידנית.",
+                                        en: "No historical rate was found for this date. Try another date or enter a manual rate."
+                                    )
+                                }
+                                return
+                            }
 
-                        guard let conversion else {
-                            errorMessage = currencyConversionUnavailableText(
-                                amount: amount,
-                                sourceCurrency: selectedCurrency,
-                                targetCurrency: primaryCurrency,
-                                language: appLanguage
-                            )
-                            return
+                            await MainActor.run {
+                                onSave(expense.updated(
+                                    category: category,
+                                    amount: conversion.convertedAmount,
+                                    refundedAmount: refundedAmount,
+                                    date: date,
+                                    name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                                    originalAmount: amount,
+                                    originalCurrencyCode: selectedCurrency.code,
+                                    exchangeRate: conversion.exchangeRate,
+                                    exchangeRateDate: conversion.exchangeRateDate,
+                                    exchangeRateSource: conversion.exchangeRateSource,
+                                    exchangeRateMethod: conversion.exchangeRateMethod,
+                                    fetchedAt: conversion.fetchedAt,
+                                    convertedAmount: conversion.convertedAmount,
+                                    convertedCurrencyCode: primaryCurrency.code
+                                ))
+                            }
                         }
-
-                        onSave(expense.updated(
-                            category: category,
-                            amount: conversion.convertedAmount,
-                            refundedAmount: refundedAmount,
-                            date: date,
-                            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-                            originalAmount: amount,
-                            originalCurrencyCode: selectedCurrency.code,
-                            exchangeRate: conversion.exchangeRate,
-                            exchangeRateDate: conversion.exchangeRateDate,
-                            convertedAmount: conversion.convertedAmount,
-                            convertedCurrencyCode: primaryCurrency.code
-                        ))
                         return
                     }
 
@@ -9709,43 +10068,38 @@ private struct HistoricalExpenseEditorView: View {
                     let primaryCurrency = Storage.loadCurrency()
 
                     if selectedCurrency != primaryCurrency {
-                        guard !ExpenseCalculations.requiresHistoricalExchangeRate(
-                            expenseDate: expenseDate,
-                            sourceCurrencyCode: selectedCurrency.code,
-                            primaryCurrencyCode: primaryCurrency.code
-                        ) else {
-                            errorMessage = appLanguage.text(
-                                he: "לא ניתן להוסיף הוצאה בדיעבד במטבע זר בלי שער היסטורי לתאריך ההוצאה",
-                                en: "Past foreign-currency expenses require a historical exchange rate for the expense date"
-                            )
-                            return
-                        }
+                        Task {
+                            guard let conversion = await CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: primaryCurrency, on: expenseDate) else {
+                                await MainActor.run {
+                                    errorMessage = appLanguage.text(
+                                        he: "לא נמצא שער היסטורי לתאריך הזה. נסה תאריך אחר או הזן שער ידנית.",
+                                        en: "No historical rate was found for this date. Try another date or enter a manual rate."
+                                    )
+                                }
+                                return
+                            }
 
-                        guard let conversion = CurrencyExchangeService.convert(amount: amount, from: selectedCurrency, to: primaryCurrency) else {
-                            errorMessage = currencyConversionUnavailableText(
-                                amount: amount,
-                                sourceCurrency: selectedCurrency,
-                                targetCurrency: primaryCurrency,
-                                language: appLanguage
-                            )
-                            return
+                            await MainActor.run {
+                                onSave(Expense(
+                                    categoryId: category.id,
+                                    categoryName: category.name,
+                                    amount: conversion.convertedAmount,
+                                    createdAt: Date(),
+                                    date: expenseDate,
+                                    name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                                    source: .backfill,
+                                    originalAmount: amount,
+                                    originalCurrencyCode: selectedCurrency.code,
+                                    exchangeRate: conversion.exchangeRate,
+                                    exchangeRateDate: conversion.exchangeRateDate,
+                                    exchangeRateSource: conversion.exchangeRateSource,
+                                    exchangeRateMethod: conversion.exchangeRateMethod,
+                                    fetchedAt: conversion.fetchedAt,
+                                    convertedAmount: conversion.convertedAmount,
+                                    convertedCurrencyCode: primaryCurrency.code
+                                ))
+                            }
                         }
-
-                        onSave(Expense(
-                            categoryId: category.id,
-                            categoryName: category.name,
-                            amount: conversion.convertedAmount,
-                            createdAt: Date(),
-                            date: expenseDate,
-                            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-                            source: .backfill,
-                            originalAmount: amount,
-                            originalCurrencyCode: selectedCurrency.code,
-                            exchangeRate: conversion.exchangeRate,
-                            exchangeRateDate: conversion.exchangeRateDate,
-                            convertedAmount: conversion.convertedAmount,
-                            convertedCurrencyCode: primaryCurrency.code
-                        ))
                         return
                     }
 
@@ -10671,7 +11025,7 @@ private struct BackfillExpenseView: View {
     @Environment(\.appLanguage) private var appLanguage
 
     let categories: [ExpenseCategory]
-    let onSave: (BackfillExpenseMode, Decimal, CurrencyOption, Date, Int, String?, String?, String) -> String?
+    let onSave: (BackfillExpenseMode, Decimal, CurrencyOption, Date, Int, String?, String?, String) async -> String?
     let onClose: () -> Void
 
     @State private var mode: BackfillExpenseMode = .oneTime
@@ -10686,6 +11040,7 @@ private struct BackfillExpenseView: View {
     @State private var newCategoryName = ""
     @State private var shouldContinueAddingToCategory = true
     @State private var errorMessage: String?
+    @State private var isSaving = false
 
     private var parsedAmount: Decimal? {
         Decimal(string: amountText, locale: Locale(identifier: "en_US_POSIX"))
@@ -10802,10 +11157,10 @@ private struct BackfillExpenseView: View {
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button(appLanguage.text(he: "הוסף", en: "Add")) {
+                    Button(isSaving ? appLanguage.text(he: "שומר...", en: "Saving...") : appLanguage.text(he: "הוסף", en: "Add")) {
                         save()
                     }
-                    .disabled(!canSave)
+                    .disabled(!canSave || isSaving)
                 }
             }
         }
@@ -10852,6 +11207,10 @@ private struct BackfillExpenseView: View {
     }
 
     private func save() {
+        guard !isSaving else {
+            return
+        }
+
         guard let amount = parsedAmount else {
             errorMessage = appLanguage.text(he: "סכום לא תקין", en: "Invalid amount")
             return
@@ -10859,16 +11218,24 @@ private struct BackfillExpenseView: View {
 
         clampSelectedMonth()
 
-        errorMessage = onSave(
-            mode,
-            amount,
-            selectedCurrency,
-            Calendar.current.normalizedMonthDate(for: selectedMonth),
-            mode == .recurring ? monthCount : 1,
-            categoryMode == .existing ? selectedCategoryId : nil,
-            categoryMode == .new ? newCategoryName : nil,
-            expenseName
-        )
+        isSaving = true
+        Task {
+            let saveError = await onSave(
+                mode,
+                amount,
+                selectedCurrency,
+                Calendar.current.normalizedMonthDate(for: selectedMonth),
+                mode == .recurring ? monthCount : 1,
+                categoryMode == .existing ? selectedCategoryId : nil,
+                categoryMode == .new ? newCategoryName : nil,
+                expenseName
+            )
+
+            await MainActor.run {
+                errorMessage = saveError
+                isSaving = false
+            }
+        }
     }
 
     private func clampSelectedMonth() {
@@ -11250,6 +11617,7 @@ private enum ReassignCategoryMode {
 
 private struct ManageCategoriesView: View {
     @Environment(\.appLanguage) private var appLanguage
+    @EnvironmentObject private var undoToastStore: UndoToastStore
 
     @Binding var categories: [ExpenseCategory]
     @Binding var expenses: [Expense]
@@ -11615,6 +11983,7 @@ private struct ManageCategoriesView: View {
             return appLanguage.text(he: "קטגוריה זו כבר קיימת", en: "This category already exists")
         }
 
+        let previousCategory = categories[index]
         categories[index] = category.updated(
             name: trimmedName,
             systemImageName: systemImageName,
@@ -11622,6 +11991,14 @@ private struct ManageCategoriesView: View {
             monthlyTarget: monthlyTarget
         )
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נערכה קטגוריה", en: "Category edited")) {
+            guard let restoreIndex = categories.firstIndex(where: { $0.id == previousCategory.id }) else {
+                return
+            }
+
+            categories[restoreIndex] = previousCategory
+            onPersist()
+        }
         clearRenameState()
         return nil
     }
@@ -11631,6 +12008,7 @@ private struct ManageCategoriesView: View {
             return
         }
 
+        let previousCategory = categories[index]
         categories[index] = categories[index].updated(
             name: categories[index].name,
             systemImageName: categories[index].systemImageName,
@@ -11638,6 +12016,22 @@ private struct ManageCategoriesView: View {
             monthlyTarget: monthlyTarget
         )
         onPersist()
+        presentUndo(message: appLanguage.text(he: "נערך יעד קטגוריה", en: "Category target edited")) {
+            guard let restoreIndex = categories.firstIndex(where: { $0.id == previousCategory.id }) else {
+                return
+            }
+
+            categories[restoreIndex] = previousCategory
+            onPersist()
+        }
+    }
+
+    private func presentUndo(message: String, undo: @escaping () -> Void) {
+        guard Storage.loadUndoEnabled() else {
+            return
+        }
+
+        undoToastStore.show(message: message, duration: TimeInterval(Storage.loadUndoDuration()), undo: undo)
     }
 
     private func startDeleting(_ category: ExpenseCategory) {
@@ -12702,12 +13096,7 @@ private enum CurrencyOption: String, CaseIterable, Identifiable, Codable {
     }
 
     var isSupportedByCurrentExchangeRateSource: Bool {
-        switch self {
-        case .thb:
-            false
-        default:
-            true
-        }
+        true
     }
 
     static var selectableCases: [CurrencyOption] {
@@ -12761,6 +13150,43 @@ private struct CurrencyExchangeRate: Codable {
     let rateInILS: Decimal
     let unit: Decimal
     let rateDate: Date
+    let source: ExchangeRateSource
+    let method: ExchangeRateMethod
+
+    init(
+        currencyCode: String,
+        rateInILS: Decimal,
+        unit: Decimal,
+        rateDate: Date,
+        source: ExchangeRateSource = .bankOfIsrael,
+        method: ExchangeRateMethod = .direct
+    ) {
+        self.currencyCode = currencyCode
+        self.rateInILS = rateInILS
+        self.unit = unit
+        self.rateDate = rateDate
+        self.source = source
+        self.method = method
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case currencyCode
+        case rateInILS
+        case unit
+        case rateDate
+        case source
+        case method
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        currencyCode = try container.decode(String.self, forKey: .currencyCode)
+        rateInILS = try container.decode(Decimal.self, forKey: .rateInILS)
+        unit = try container.decode(Decimal.self, forKey: .unit)
+        rateDate = try container.decode(Date.self, forKey: .rateDate)
+        source = try container.decodeIfPresent(ExchangeRateSource.self, forKey: .source) ?? .bankOfIsrael
+        method = try container.decodeIfPresent(ExchangeRateMethod.self, forKey: .method) ?? .direct
+    }
 
     var normalizedRateInILS: Decimal {
         guard unit > 0 else {
@@ -12775,6 +13201,43 @@ private struct CurrencyConversionResult {
     let convertedAmount: Decimal
     let exchangeRate: Decimal
     let exchangeRateDate: Date
+    let exchangeRateSource: ExchangeRateSource
+    let exchangeRateMethod: ExchangeRateMethod
+    let fetchedAt: Date
+}
+
+private enum ExchangeRateSource: String, Codable {
+    case bankOfIsrael = "BankOfIsrael"
+    case yahooFinance = "YahooFinance"
+    case frankfurter = "Frankfurter"
+    case manual = "Manual"
+
+    func title(for language: AppLanguage) -> String {
+        switch self {
+        case .bankOfIsrael:
+            language.text(he: "בנק ישראל", en: "Bank of Israel")
+        case .yahooFinance:
+            "Yahoo Finance"
+        case .frankfurter:
+            "Frankfurter"
+        case .manual:
+            language.text(he: "ידני", en: "Manual")
+        }
+    }
+}
+
+private enum ExchangeRateMethod: String, Codable {
+    case direct = "Direct"
+    case crossRate = "CrossRate"
+
+    func title(for language: AppLanguage) -> String {
+        switch self {
+        case .direct:
+            language.text(he: "ישיר", en: "Direct")
+        case .crossRate:
+            language.text(he: "הצלבה", en: "Cross-rate")
+        }
+    }
 }
 
 private enum CurrencyExchangeService {
@@ -12783,6 +13246,23 @@ private enum CurrencyExchangeService {
 
     static func markRatesStale() {
         UserDefaults.standard.removeObject(forKey: Storage.currencyRatesLastRefreshKey)
+    }
+
+    static func saveManualRateInILS(for currency: CurrencyOption, rateInILS: Decimal) {
+        guard currency != .ils, rateInILS > 0 else {
+            return
+        }
+
+        var rates = Storage.loadCurrencyExchangeRates()
+        rates[currency.code] = CurrencyExchangeRate(
+            currencyCode: currency.code,
+            rateInILS: rateInILS,
+            unit: 1,
+            rateDate: Date(),
+            source: .manual,
+            method: .direct
+        )
+        Storage.saveCurrencyExchangeRates(rates)
     }
 
     static func refreshIfNeeded() async {
@@ -12799,7 +13279,14 @@ private enum CurrencyExchangeService {
         }
 
         if sourceCurrency == targetCurrency {
-            return CurrencyConversionResult(convertedAmount: amount, exchangeRate: 1, exchangeRateDate: Date())
+            return CurrencyConversionResult(
+                convertedAmount: amount,
+                exchangeRate: 1,
+                exchangeRateDate: Date(),
+                exchangeRateSource: .manual,
+                exchangeRateMethod: .direct,
+                fetchedAt: Date()
+            )
         }
 
         var rates = Storage.loadCurrencyExchangeRates()
@@ -12816,12 +13303,96 @@ private enum CurrencyExchangeService {
         let convertedAmount = amountInILS / targetRate.normalizedRateInILS
         let directRate = sourceRate.normalizedRateInILS / targetRate.normalizedRateInILS
         let rateDate = min(sourceRate.rateDate, targetRate.rateDate)
+        let source = combinedExchangeRateSource(sourceRate.source, targetRate.source)
+        let method = sourceRate.method == .direct && targetRate.method == .direct ? ExchangeRateMethod.direct : ExchangeRateMethod.crossRate
 
         return CurrencyConversionResult(
             convertedAmount: convertedAmount.roundedCurrencyAmount,
             exchangeRate: directRate,
-            exchangeRateDate: rateDate
+            exchangeRateDate: rateDate,
+            exchangeRateSource: source,
+            exchangeRateMethod: method,
+            fetchedAt: Date()
         )
+    }
+
+    static func convert(
+        amount: Decimal,
+        from sourceCurrency: CurrencyOption,
+        to targetCurrency: CurrencyOption,
+        on expenseDate: Date,
+        calendar: Calendar = .current
+    ) async -> CurrencyConversionResult? {
+        guard amount > 0 else {
+            return nil
+        }
+
+        if sourceCurrency == targetCurrency {
+            return CurrencyConversionResult(
+                convertedAmount: amount,
+                exchangeRate: 1,
+                exchangeRateDate: expenseDate,
+                exchangeRateSource: .manual,
+                exchangeRateMethod: .direct,
+                fetchedAt: Date()
+            )
+        }
+
+        if calendar.isDate(expenseDate, inSameDayAs: Date()) {
+            await refreshIfNeeded()
+            return convert(amount: amount, from: sourceCurrency, to: targetCurrency)
+        }
+
+        if let rate = await YahooFinanceExchangeRateClient.fetchPairRate(
+            from: sourceCurrency,
+            to: targetCurrency,
+            on: expenseDate
+        ) {
+            return conversionResult(amount: amount, exchangeRate: rate.rate, rateDate: rate.date, source: .yahooFinance, method: rate.method)
+        }
+
+        if let rate = await FrankfurterExchangeRateClient.fetchPairRate(
+            from: sourceCurrency,
+            to: targetCurrency,
+            on: expenseDate
+        ) {
+            return conversionResult(amount: amount, exchangeRate: rate.rate, rateDate: rate.date, source: .frankfurter, method: .direct)
+        }
+
+        return nil
+    }
+
+    private static func conversionResult(
+        amount: Decimal,
+        exchangeRate: Decimal,
+        rateDate: Date,
+        source: ExchangeRateSource,
+        method: ExchangeRateMethod
+    ) -> CurrencyConversionResult {
+        CurrencyConversionResult(
+            convertedAmount: (amount * exchangeRate).roundedCurrencyAmount,
+            exchangeRate: exchangeRate,
+            exchangeRateDate: rateDate,
+            exchangeRateSource: source,
+            exchangeRateMethod: method,
+            fetchedAt: Date()
+        )
+    }
+
+    private static func combinedExchangeRateSource(_ source: ExchangeRateSource, _ target: ExchangeRateSource) -> ExchangeRateSource {
+        if source == .manual || target == .manual {
+            return .manual
+        }
+
+        if source == target {
+            return source
+        }
+
+        if source == .bankOfIsrael && target == .bankOfIsrael {
+            return .bankOfIsrael
+        }
+
+        return source == .frankfurter || target == .frankfurter ? .frankfurter : .yahooFinance
     }
 
     private static var shouldRefreshRates: Bool {
@@ -12833,24 +13404,258 @@ private enum CurrencyExchangeService {
     }
 
     private static func refreshRates() async {
-        guard let bankOfIsraelURL else {
+        var rates: [String: CurrencyExchangeRate] = [:]
+
+        if let bankOfIsraelURL {
+            do {
+                let (data, _) = try await URLSession.shared.data(from: bankOfIsraelURL)
+                rates = try BankOfIsraelExchangeRateParser.parse(data: data)
+            } catch {
+                rates = [:]
+            }
+        }
+
+        await appendYahooFallbackRates(to: &rates)
+        await appendFrankfurterFallbackRates(to: &rates)
+        rates["ILS"] = CurrencyExchangeRate(currencyCode: "ILS", rateInILS: 1, unit: 1, rateDate: Date())
+
+        guard rates.count > 1 else {
             return
+        }
+
+        Storage.saveCurrencyExchangeRates(rates)
+        UserDefaults.standard.set(Date(), forKey: Storage.currencyRatesLastRefreshKey)
+    }
+
+    private static func appendYahooFallbackRates(to rates: inout [String: CurrencyExchangeRate]) async {
+        for currency in CurrencyOption.allCases where currency != .ils {
+            guard rates[currency.code] == nil else {
+                continue
+            }
+
+            if let rate = await YahooFinanceExchangeRateClient.fetchRateInILS(for: currency) {
+                rates[currency.code] = rate
+            }
+        }
+    }
+
+    private static func appendFrankfurterFallbackRates(to rates: inout [String: CurrencyExchangeRate]) async {
+        for currency in CurrencyOption.allCases where currency != .ils {
+            guard rates[currency.code] == nil else {
+                continue
+            }
+
+            if let rate = await FrankfurterExchangeRateClient.fetchRateInILS(for: currency) {
+                rates[currency.code] = rate
+            }
+        }
+    }
+}
+
+private enum YahooFinanceExchangeRateClient {
+    static func fetchRateInILS(for currency: CurrencyOption) async -> CurrencyExchangeRate? {
+        if currency == .ils {
+            return CurrencyExchangeRate(currencyCode: currency.code, rateInILS: 1, unit: 1, rateDate: Date())
+        }
+
+        if let directRate = await fetchPairRate(from: currency, to: .ils, on: nil) {
+            return CurrencyExchangeRate(
+                currencyCode: currency.code,
+                rateInILS: directRate.rate,
+                unit: 1,
+                rateDate: directRate.date,
+                source: .yahooFinance,
+                method: .direct
+            )
+        }
+
+        return nil
+    }
+
+    static func fetchPairRate(from sourceCurrency: CurrencyOption, to targetCurrency: CurrencyOption, on date: Date?) async -> (rate: Decimal, date: Date, method: ExchangeRateMethod)? {
+        if let directRate = await fetchYahooPairRate(from: sourceCurrency.code, to: targetCurrency.code, on: date) {
+            return (directRate.rate, directRate.date, .direct)
+        }
+
+        if let inverseRate = await fetchYahooPairRate(from: targetCurrency.code, to: sourceCurrency.code, on: date),
+           inverseRate.rate > 0 {
+            return (1 / inverseRate.rate, inverseRate.date, .direct)
+        }
+
+        for bridgeCurrency in [CurrencyOption.usd, CurrencyOption.eur] where bridgeCurrency != sourceCurrency && bridgeCurrency != targetCurrency {
+            guard let sourceToBridge = await fetchPairRateDirectOrInverse(from: sourceCurrency, to: bridgeCurrency, on: date),
+                  let bridgeToTarget = await fetchPairRateDirectOrInverse(from: bridgeCurrency, to: targetCurrency, on: date) else {
+                continue
+            }
+
+            return (sourceToBridge.rate * bridgeToTarget.rate, min(sourceToBridge.date, bridgeToTarget.date), .crossRate)
+        }
+
+        return nil
+    }
+
+    private static func fetchPairRateDirectOrInverse(from sourceCurrency: CurrencyOption, to targetCurrency: CurrencyOption, on date: Date?) async -> (rate: Decimal, date: Date)? {
+        if let directRate = await fetchYahooPairRate(from: sourceCurrency.code, to: targetCurrency.code, on: date) {
+            return directRate
+        }
+
+        if let inverseRate = await fetchYahooPairRate(from: targetCurrency.code, to: sourceCurrency.code, on: date),
+           inverseRate.rate > 0 {
+            return (1 / inverseRate.rate, inverseRate.date)
+        }
+
+        return nil
+    }
+
+    private static func fetchYahooPairRate(from sourceCode: String, to targetCode: String, on date: Date?) async -> (rate: Decimal, date: Date)? {
+        guard let url = yahooChartURL(sourceCode: sourceCode, targetCode: targetCode, date: date) else {
+            return nil
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            return try parseLatestClose(data: data)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func yahooChartURL(sourceCode: String, targetCode: String, date: Date?) -> URL? {
+        let symbol = "\(sourceCode)\(targetCode)=X"
+        guard let date else {
+            return URL(string: "https://query2.finance.yahoo.com/v8/finance/chart/\(symbol)?range=5d&interval=1d")
+        }
+
+        let calendar = Calendar(identifier: .gregorian)
+        let startOfDay = calendar.startOfDay(for: date)
+        let endOfWindow = calendar.date(byAdding: .day, value: 2, to: startOfDay) ?? date
+        let period1 = Int(startOfDay.timeIntervalSince1970)
+        let period2 = Int(endOfWindow.timeIntervalSince1970)
+        return URL(string: "https://query2.finance.yahoo.com/v8/finance/chart/\(symbol)?period1=\(period1)&period2=\(period2)&interval=1d")
+    }
+
+    static func parseLatestClose(data: Data) throws -> (rate: Decimal, date: Date)? {
+        let json = try JSONSerialization.jsonObject(with: data)
+        guard let chart = (json as? [String: Any])?["chart"] as? [String: Any],
+              let results = chart["result"] as? [[String: Any]],
+              let result = results.first,
+              chart["error"] == nil || chart["error"] is NSNull,
+              let rawTimestamps = result["timestamp"] as? [Any],
+              let indicators = result["indicators"] as? [String: Any],
+              let quotes = indicators["quote"] as? [[String: Any]],
+              let quote = quotes.first,
+              let closes = quote["close"] as? [Any] else {
+            return nil
+        }
+
+        let timestamps = rawTimestamps.compactMap { value -> TimeInterval? in
+            if let number = value as? NSNumber {
+                return number.doubleValue
+            }
+
+            if let double = value as? Double {
+                return double
+            }
+
+            return nil
+        }
+
+        for index in closes.indices.reversed() {
+            guard index < timestamps.count else {
+                continue
+            }
+
+            if let number = closes[index] as? NSNumber, number.decimalValue > 0 {
+                return (number.decimalValue, Date(timeIntervalSince1970: timestamps[index]))
+            }
+        }
+
+        return nil
+    }
+}
+
+private enum FrankfurterExchangeRateClient {
+    static func fetchRateInILS(for currency: CurrencyOption) async -> CurrencyExchangeRate? {
+        guard let pairRate = await fetchPairRate(from: currency, to: .ils, on: nil) else {
+            return nil
+        }
+
+        return CurrencyExchangeRate(
+            currencyCode: currency.code,
+            rateInILS: pairRate.rate,
+            unit: 1,
+            rateDate: pairRate.date,
+            source: .frankfurter,
+            method: .direct
+        )
+    }
+
+    static func fetchPairRate(from sourceCurrency: CurrencyOption, to targetCurrency: CurrencyOption, on date: Date?) async -> (rate: Decimal, date: Date)? {
+        guard let url = frankfurterURL(sourceCurrency: sourceCurrency, targetCurrency: targetCurrency, date: date) else {
+            return nil
         }
 
         do {
-            let (data, _) = try await URLSession.shared.data(from: bankOfIsraelURL)
-            let rates = try BankOfIsraelExchangeRateParser.parse(data: data)
-
-            guard !rates.isEmpty else {
-                return
-            }
-
-            Storage.saveCurrencyExchangeRates(rates)
-            UserDefaults.standard.set(Date(), forKey: Storage.currencyRatesLastRefreshKey)
+            let (data, _) = try await URLSession.shared.data(from: url)
+            return try parsePairRate(data: data)
         } catch {
-            return
+            return nil
         }
     }
+
+    private static func frankfurterURL(sourceCurrency: CurrencyOption, targetCurrency: CurrencyOption, date: Date?) -> URL? {
+        let dateQuery: String
+        if let date {
+            dateQuery = "?date=\(date.yearMonthDayString)"
+        } else {
+            dateQuery = ""
+        }
+
+        return URL(string: "https://api.frankfurter.dev/v2/rate/\(sourceCurrency.code)/\(targetCurrency.code)\(dateQuery)")
+    }
+
+    static func parsePairRate(data: Data) throws -> (rate: Decimal, date: Date)? {
+        let json = try JSONSerialization.jsonObject(with: data)
+        guard let object = json as? [String: Any],
+              let rate = decimalValue(object["rate"]),
+              rate > 0 else {
+            return nil
+        }
+
+        let date = (object["date"] as? String).flatMap { DateFormatter.yearMonthDay.date(from: $0) } ?? Date()
+        return (rate, date)
+    }
+
+    private static func decimalValue(_ value: Any?) -> Decimal? {
+        if let number = value as? NSNumber {
+            return number.decimalValue
+        }
+
+        if let string = value as? String {
+            return Decimal(string: string, locale: Locale(identifier: "en_US_POSIX"))
+        }
+
+        return nil
+    }
+}
+
+private extension Date {
+    var yearMonthDayString: String {
+        DateFormatter.yearMonthDay.string(from: self)
+    }
+}
+
+private extension DateFormatter {
+    static let yearMonthDay: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
 }
 
 private enum BankOfIsraelExchangeRateParser {
@@ -13867,6 +14672,9 @@ private struct Expense: Identifiable, Codable {
     let originalCurrencyCode: String
     let exchangeRate: Decimal
     let exchangeRateDate: Date
+    let exchangeRateSource: ExchangeRateSource
+    let exchangeRateMethod: ExchangeRateMethod
+    let fetchedAt: Date
     let convertedAmount: Decimal
     let convertedCurrencyCode: String
 
@@ -13886,6 +14694,9 @@ private struct Expense: Identifiable, Codable {
         originalCurrencyCode: String? = nil,
         exchangeRate: Decimal = 1,
         exchangeRateDate: Date = Date(),
+        exchangeRateSource: ExchangeRateSource = .bankOfIsrael,
+        exchangeRateMethod: ExchangeRateMethod = .direct,
+        fetchedAt: Date = Date(),
         convertedAmount: Decimal? = nil,
         convertedCurrencyCode: String? = nil
     ) {
@@ -13904,6 +14715,9 @@ private struct Expense: Identifiable, Codable {
         self.originalCurrencyCode = originalCurrencyCode ?? Storage.loadCurrency().code
         self.exchangeRate = exchangeRate
         self.exchangeRateDate = exchangeRateDate
+        self.exchangeRateSource = exchangeRateSource
+        self.exchangeRateMethod = exchangeRateMethod
+        self.fetchedAt = fetchedAt
         self.convertedAmount = convertedAmount ?? amount
         self.convertedCurrencyCode = convertedCurrencyCode ?? Storage.loadCurrency().code
     }
@@ -13924,6 +14738,9 @@ private struct Expense: Identifiable, Codable {
         case originalCurrencyCode
         case exchangeRate
         case exchangeRateDate
+        case exchangeRateSource
+        case exchangeRateMethod
+        case fetchedAt
         case convertedAmount
         case convertedCurrencyCode
     }
@@ -13947,6 +14764,9 @@ private struct Expense: Identifiable, Codable {
         originalCurrencyCode = try container.decodeIfPresent(String.self, forKey: .originalCurrencyCode) ?? Storage.loadCurrency().code
         exchangeRate = try container.decodeIfPresent(Decimal.self, forKey: .exchangeRate) ?? 1
         exchangeRateDate = try container.decodeIfPresent(Date.self, forKey: .exchangeRateDate) ?? createdAt
+        exchangeRateSource = try container.decodeIfPresent(ExchangeRateSource.self, forKey: .exchangeRateSource) ?? .bankOfIsrael
+        exchangeRateMethod = try container.decodeIfPresent(ExchangeRateMethod.self, forKey: .exchangeRateMethod) ?? .direct
+        fetchedAt = try container.decodeIfPresent(Date.self, forKey: .fetchedAt) ?? exchangeRateDate
         convertedAmount = try container.decodeIfPresent(Decimal.self, forKey: .convertedAmount) ?? amount
         convertedCurrencyCode = try container.decodeIfPresent(String.self, forKey: .convertedCurrencyCode) ?? Storage.loadCurrency().code
     }
@@ -13972,6 +14792,9 @@ private struct Expense: Identifiable, Codable {
             originalCurrencyCode: originalCurrencyCode,
             exchangeRate: exchangeRate,
             exchangeRateDate: exchangeRateDate,
+            exchangeRateSource: exchangeRateSource,
+            exchangeRateMethod: exchangeRateMethod,
+            fetchedAt: fetchedAt,
             convertedAmount: convertedAmount,
             convertedCurrencyCode: convertedCurrencyCode
         )
@@ -13994,6 +14817,9 @@ private struct Expense: Identifiable, Codable {
             originalCurrencyCode: originalCurrencyCode,
             exchangeRate: exchangeRate,
             exchangeRateDate: exchangeRateDate,
+            exchangeRateSource: exchangeRateSource,
+            exchangeRateMethod: exchangeRateMethod,
+            fetchedAt: fetchedAt,
             convertedAmount: convertedAmount,
             convertedCurrencyCode: convertedCurrencyCode
         )
@@ -14009,6 +14835,9 @@ private struct Expense: Identifiable, Codable {
         originalCurrencyCode: String,
         exchangeRate: Decimal,
         exchangeRateDate: Date,
+        exchangeRateSource: ExchangeRateSource = .bankOfIsrael,
+        exchangeRateMethod: ExchangeRateMethod = .direct,
+        fetchedAt: Date = Date(),
         convertedAmount: Decimal,
         convertedCurrencyCode: String
     ) -> Expense {
@@ -14028,6 +14857,9 @@ private struct Expense: Identifiable, Codable {
             originalCurrencyCode: originalCurrencyCode,
             exchangeRate: exchangeRate,
             exchangeRateDate: exchangeRateDate,
+            exchangeRateSource: exchangeRateSource,
+            exchangeRateMethod: exchangeRateMethod,
+            fetchedAt: fetchedAt,
             convertedAmount: convertedAmount,
             convertedCurrencyCode: convertedCurrencyCode
         )
@@ -14291,6 +15123,8 @@ private enum Storage {
     private static let temporaryCurrencyKey = "temporaryCurrency"
     private static let temporaryCurrencyStartDateKey = "temporaryCurrencyStartDate"
     private static let temporaryCurrencyExpirationDateKey = "temporaryCurrencyExpirationDate"
+    private static let undoEnabledKey = "undoEnabled"
+    private static let undoDurationKey = "undoDuration"
     static let currencyRatesLastRefreshKey = "currencyRatesLastRefresh"
 
     static func loadExpenses() -> [Expense] {
@@ -14615,6 +15449,27 @@ private enum Storage {
         UserDefaults.standard.set(balance.plainString, forKey: checkingBalanceKey)
     }
 
+    static func loadUndoEnabled() -> Bool {
+        guard UserDefaults.standard.object(forKey: undoEnabledKey) != nil else {
+            return true
+        }
+
+        return UserDefaults.standard.bool(forKey: undoEnabledKey)
+    }
+
+    static func saveUndoEnabled(_ isEnabled: Bool) {
+        UserDefaults.standard.set(isEnabled, forKey: undoEnabledKey)
+    }
+
+    static func loadUndoDuration() -> Int {
+        let duration = UserDefaults.standard.integer(forKey: undoDurationKey)
+        return duration == 0 ? 3 : ExpenseCalculations.clampedUndoDuration(duration)
+    }
+
+    static func saveUndoDuration(_ duration: Int) {
+        UserDefaults.standard.set(ExpenseCalculations.clampedUndoDuration(duration), forKey: undoDurationKey)
+    }
+
     static func loadSavingsGoal() -> Decimal? {
         guard let value = UserDefaults.standard.string(forKey: savingsGoalKey),
               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -14692,6 +15547,8 @@ private enum Storage {
             temporaryCurrencyKey,
             temporaryCurrencyStartDateKey,
             temporaryCurrencyExpirationDateKey,
+            undoEnabledKey,
+            undoDurationKey,
             currencyRatesLastRefreshKey
         ].forEach { key in
             UserDefaults.standard.removeObject(forKey: key)
